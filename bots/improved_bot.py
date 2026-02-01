@@ -28,6 +28,9 @@ class BotState:
 
 
 class BotPlayer:
+    HEURISTIC_EXPIRY = "expiry"
+    HEURISTIC_INGREDIENTS = "ingredients"
+
     def __init__(self, map_copy):
         self.map = map_copy
 
@@ -1001,31 +1004,32 @@ class BotPlayer:
         total += dist_shop_to_submit + SUBMIT
         return total
 
-    def calculate_order_heuristic(self, controller, bot_id, state, order, turn, team_money):
-        # Calculate heuristic score for an order.
-        # Score = Profit + (Penalty * 0.5) + (Urgency Bonus)
-        # Returns -float('inf') if impossible to complete in time.
+    def _order_is_doable(self, controller, bot_id, state, order, turn):
         my_dist = self.bot_dist_maps.get(bot_id)
         if my_dist and not self._has_access(my_dist, self.submit_loc):
+            return False
+        time_left = order['expires_turn'] - turn
+        if time_left <= 0:
+            return False
+        sim_time = self.simulate_order_time(
+            controller, bot_id, state, order, turn)
+        return sim_time <= time_left
+
+    def calculate_order_heuristic(self, controller, bot_id, state, order, turn, team_money, heuristic=None):
+        # Returns -float('inf') if impossible to complete in time.
+        if not self._order_is_doable(controller, bot_id, state, order, turn):
             return -float('inf')
 
-        # 1. Time + ingredient count focus
         ingredient_count = len(order['required'])
         time_left = order['expires_turn'] - turn
 
-        # Short-circuit if we cannot finish before expiry.
-        sim_time = self.simulate_order_time(
-            controller, bot_id, state, order, turn)
-        if sim_time > time_left:
-            return -float('inf')
+        if heuristic == self.HEURISTIC_EXPIRY:
+            # Primary key: earliest expiration.
+            # Secondary key: fewer ingredients.
+            return (-time_left * 1_000_000) - ingredient_count
 
-        # 2. Score
-        # Primary key: fewer ingredients is always better.
-        # Secondary key: more time per ingredient is better.
-        time_per_ingredient = time_left / max(1, ingredient_count)
-        score = (-ingredient_count * 100000) + time_per_ingredient
-
-        return score
+        # Default: strictly fewer ingredients, time as tie-breaker.
+        return (-ingredient_count * 1_000_000) - time_left
 
     def play_turn(self, controller: RobotController):
         bots = controller.get_team_bot_ids(controller.get_team())
@@ -1119,36 +1123,39 @@ class BotPlayer:
 
             if is_bot_1:
                 self.run_bot_1_behavior(
-                    controller, bot_id, my_state, others_reserved_counters, claimed_orders, other_bots_locs)
+                    controller, bot_id, my_state, others_reserved_counters, claimed_orders, other_bots_locs,
+                    order_heuristic=self.HEURISTIC_EXPIRY)
             elif is_bot_2:
                 self.run_bot_2_behavior(
-                    controller, bot_id, my_state, others_reserved_counters, claimed_orders, other_bots_locs)
+                    controller, bot_id, my_state, others_reserved_counters, claimed_orders, other_bots_locs,
+                    order_heuristic=self.HEURISTIC_INGREDIENTS)
             else:
                 # Default behavior for extra bots
                 self.run_standard_logic(
-                    controller, bot_id, my_state, others_reserved_counters, claimed_orders, other_bots_locs)
+                    controller, bot_id, my_state, others_reserved_counters, claimed_orders, other_bots_locs,
+                    order_heuristic=self.HEURISTIC_INGREDIENTS)
 
     # Bot 1 Behavior
 
-    def run_bot_1_behavior(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles):
-        # Bot 1 follows standard logic.
+    def run_bot_1_behavior(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles, order_heuristic):
+        # Bot 1 follows standard logic (expiry-first ordering).
         self.run_standard_logic(controller, bot_id, state,
-                                reserved_counters, claimed_orders, blocked_tiles)
+                                reserved_counters, claimed_orders, blocked_tiles, order_heuristic)
 
     # Bot 2 Behavior
 
-    def run_bot_2_behavior(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles):
+    def run_bot_2_behavior(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles, order_heuristic):
         # Bot 2 has smart recovery logic for expired orders.
         if state.current_order:
             if self.handle_expired_order(controller, bot_id, state, claimed_orders):
                 pass  # State updated by recovery
 
         self.run_standard_logic(controller, bot_id, state,
-                                reserved_counters, claimed_orders, blocked_tiles)
+                                reserved_counters, claimed_orders, blocked_tiles, order_heuristic)
 
     # Shared Logic
 
-    def run_standard_logic(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles):
+    def run_standard_logic(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles, order_heuristic):
         info = controller.get_bot_state(bot_id)
         holding = info.get('holding')
         bx, by = info['x'], info['y']
@@ -1157,7 +1164,7 @@ class BotPlayer:
         is_helper = self._is_helper_mode(my_dist)
         if not self.helper_map_active:
             self.run_normal_logic(
-                controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles)
+                controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles, order_heuristic)
             return
 
         other_dist_maps = [
@@ -1404,7 +1411,7 @@ class BotPlayer:
                         continue
 
                     score = self.calculate_order_heuristic(
-                        controller, bot_id, state, o, turn, team_money)
+                        controller, bot_id, state, o, turn, team_money, order_heuristic)
 
                     if score > best_score:
                         best_score = score
@@ -1744,7 +1751,7 @@ class BotPlayer:
                 state.work_counter = None
                 state.current_order = None
 
-    def run_normal_logic(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles):
+    def run_normal_logic(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles, order_heuristic):
         # Snapshot3 normal-map logic (no helper/handoff behaviors).
         info = controller.get_bot_state(bot_id)
         holding = info.get('holding')
@@ -1794,7 +1801,7 @@ class BotPlayer:
                         continue
 
                     score = self.calculate_order_heuristic(
-                        controller, bot_id, state, o, turn, team_money)
+                        controller, bot_id, state, o, turn, team_money, order_heuristic)
 
                     if score > best_score:
                         best_score = score
