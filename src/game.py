@@ -18,7 +18,6 @@ from game_state import GameState
 from robot_controller import RobotController
 
 from map_processor import load_two_team_maps_and_orders
-from render import Renderer
 
 
 def import_file(module_name: str, file_path: str):
@@ -137,8 +136,12 @@ class Game:
         #replay
         self.replay: List[Dict[str, Any]] = []
 
-        #renderer if available
-        self.renderer = Renderer(self.game_state) if self.render_enabled else None
+        #renderer if available (import lazily so pygame isn't required headless)
+        if self.render_enabled:
+            from render import Renderer
+            self.renderer = Renderer(self.game_state)
+        else:
+            self.renderer = None
 
     def call_player(self, team: Team) -> bool:
         '''calls the player run code'''

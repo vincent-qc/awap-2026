@@ -3,8 +3,9 @@
 
 import heapq
 from collections import deque
+from typing import List, Optional, Set, Tuple
 
-from game_constants import FoodType, GameConstants, ShopCosts
+from game_constants import FoodType, GameConstants, ShopCosts, Team
 from item import Food, Pan, Plate
 from robot_controller import RobotController
 
@@ -18,9 +19,6 @@ class BotState:
         self.work_counter = None
         self.current_order = None
         self.cooker_target = None
-        self.pending_order_ids = []
-        self.pending_items = []
-        self.handoff_queue = []
 
         # Stuck detection
         self.stuck_counter = 0
@@ -37,7 +35,6 @@ class BotPlayer:
         self.shop_loc = None
         self.submit_loc = None
         self.trash_loc = None
-        self.shops = None
         self.ingredient_sources = None
         self.landmarks = []
         self.boxes = None
@@ -47,13 +44,6 @@ class BotPlayer:
         self.dist_from_shop = None
         self.dist_from_submit = None
         self.dist_from_counters = None
-        self.dist_from_cookers = None
-        self.shared_handoff_counters = []
-        self.primary_handoff_counter = None
-        self.bot_dist_maps = {}
-        self.handoff_happened_turn = False
-        self.last_handoff_items = []
-        self.debug_board = True
 
         # Bot States: map bot_id -> BotState
         self.bot_states = {}
@@ -67,7 +57,6 @@ class BotPlayer:
         self.cached_map = m
         self.counters = []
         self.cookers = []
-        self.shops = []
         self.ingredient_sources = []
         self.landmarks = []
         self.boxes = []
@@ -76,10 +65,6 @@ class BotPlayer:
         self.dist_from_shop = None
         self.dist_from_submit = None
         self.dist_from_counters = None
-        self.dist_from_cookers = None
-        self.shared_handoff_counters = []
-        self.primary_handoff_counter = None
-        self.bot_dist_maps = {}
 
         for x in range(m.width):
             for y in range(m.height):
@@ -90,8 +75,6 @@ class BotPlayer:
                     self.cookers.append((x, y))
                 elif name == "SHOP" and self.shop_loc is None:
                     self.shop_loc = (x, y)
-                if name == "SHOP":
-                    self.shops.append((x, y))
                 if name in ("SHOP", "BOX"):
                     self.ingredient_sources.append((x, y))
                 elif name == "SUBMIT" and self.submit_loc is None:
@@ -112,13 +95,11 @@ class BotPlayer:
 
         # Precompute shortest-path distance grids for landmark proximity.
         self.dist_from_shop = self._build_dist_map(
-            self._adjacent_walkables_multi(self.shops))
+            self._adjacent_walkables(self.shop_loc))
         self.dist_from_submit = self._build_dist_map(
             self._adjacent_walkables(self.submit_loc))
         self.dist_from_counters = self._build_dist_map(
             self._adjacent_walkables_multi(self.counters))
-        self.dist_from_cookers = self._build_dist_map(
-            self._adjacent_walkables_multi(self.cookers))
 
         # Precompute cooker priority by shortest path closeness to shop + counters + submit.
         self.cooker_cluster_scores = {}
@@ -137,16 +118,6 @@ class BotPlayer:
         self.cooker_priority = sorted(
             self.cookers,
             key=lambda c: (self.cooker_cluster_scores.get(c, 0), c))
-
-        # Shared handoff counters reachable from both shops and cookers.
-        self.shared_handoff_counters = []
-        if self.dist_from_shop and self.dist_from_cookers:
-            for c in self.counters:
-                if (self._distance_to_tile(self.dist_from_shop, c) < 9999 and
-                        self._distance_to_tile(self.dist_from_cookers, c) < 9999):
-                    self.shared_handoff_counters.append(c)
-        if self.shared_handoff_counters:
-            self.primary_handoff_counter = self.shared_handoff_counters[0]
 
     def get_next_step_astar(self, controller, start, target_x, target_y, blocked=None):
         # Get next step towards target using A* with Manhattan heuristic. Returns (dx, dy) or None.
@@ -279,65 +250,6 @@ class BotPlayer:
     def _chebyshev(self, a, b):
         return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
 
-    def _tile_base_char(self, tile_name):
-        return {
-            "WALL": "#",
-            "FLOOR": ".",
-            "COUNTER": "C",
-            "COOKER": "K",
-            "SINK": "S",
-            "SINKTABLE": "T",
-            "TRASH": "R",
-            "SUBMIT": "U",
-            "SHOP": "$",
-            "BOX": "B",
-        }.get(tile_name, "?")
-
-    def _tile_item_char(self, tile):
-        item = getattr(tile, "item", None)
-        if isinstance(item, Food):
-            return item.food_name[0].lower()
-        if isinstance(item, Plate):
-            return "P"
-        if isinstance(item, Pan):
-            if item.food:
-                return item.food.food_name[0].upper()
-            return "k"
-        return None
-
-    def debug_print_board(self, controller):
-        if not self.cached_map:
-            return
-        m = self.cached_map
-        rows = []
-        for y in range(m.height - 1, -1, -1):
-            row = []
-            for x in range(m.width):
-                tile = controller.get_tile(controller.get_team(), x, y)
-                base = self._tile_base_char(tile.tile_name) if tile else "?"
-                item = self._tile_item_char(tile)
-                row.append(item if item else base)
-            rows.append("".join(row))
-        print("[BOARD]")
-        for r in rows:
-            print(r)
-
-    def debug_print_bots(self, controller, bots):
-        parts = []
-        for bid in bots:
-            info = controller.get_bot_state(bid)
-            holding = info.get('holding')
-            held = None
-            if holding:
-                if holding.get('type') == 'Food':
-                    held = holding.get('food_name')
-                elif holding.get('type') == 'Plate':
-                    held = "Plate"
-                else:
-                    held = holding.get('type')
-            parts.append(f"B{bid}@({info['x']},{info['y']}) hold={held}")
-        print("[BOTS] " + " | ".join(parts))
-
     def _adjacent_walkables(self, loc):
         if not loc or not self.cached_map:
             return []
@@ -400,147 +312,6 @@ class BotPlayer:
             if d is not None and d < best:
                 best = d
         return best
-
-    def choose_shop_for_bot(self, dist_map, bot_pos=None):
-        if not self.shops:
-            return self.shop_loc
-        best = None
-        best_dist = 9999
-        for sx, sy in self.shops:
-            d = self._distance_to_tile(
-                dist_map, (sx, sy)) if dist_map else self._chebyshev(bot_pos, (sx, sy))
-            if d < best_dist:
-                best_dist = d
-                best = (sx, sy)
-        return best or self.shop_loc
-
-    def _has_access(self, dist_map, target_pos):
-        if not dist_map or not target_pos:
-            return False
-        return self._distance_to_tile(dist_map, target_pos) < 9999
-
-    def _is_helper_mode(self, dist_map):
-        # Helper mode: bot cannot reach submit on this side of the map.
-        return dist_map is not None and not self._has_access(dist_map, self.submit_loc)
-
-    def _others_can_access_cookers(self, other_dist_maps):
-        for dm in other_dist_maps or []:
-            if any(self._has_access(dm, c) for c in self.cookers or []):
-                return True
-        return False
-
-    def _can_access_any_cooker(self, dist_map):
-        return any(self._has_access(dist_map, c) for c in self.cookers or [])
-
-    def _can_access_any_shop(self, dist_map):
-        if not dist_map or not self.shops:
-            return False
-        return any(self._has_access(dist_map, s) for s in self.shops)
-
-    def _find_handoff_food(self, controller, dist_map, require_cookable=True, require_raw=False, require_cooked=False, item_name=None):
-        counters = self.shared_handoff_counters or self.counters or []
-        for cx, cy in counters:
-            if dist_map and not self._has_access(dist_map, (cx, cy)):
-                continue
-            tile = controller.get_tile(controller.get_team(), cx, cy)
-            if tile and isinstance(tile.item, Food):
-                if require_cookable and not tile.item.can_cook:
-                    continue
-                if require_raw and tile.item.cooked_stage != 0:
-                    continue
-                if require_cooked and tile.item.cooked_stage != 1:
-                    continue
-                if item_name and tile.item.food_name != item_name:
-                    continue
-                return (cx, cy)
-        return None
-
-    def _find_handoff_counter(self, controller, dist_map, other_dist_maps):
-        if not dist_map:
-            return None
-        best = None
-        best_dist = 9999
-        counters = self.shared_handoff_counters or self.counters or []
-        shared = []
-        for cx, cy in counters:
-            tile = controller.get_tile(controller.get_team(), cx, cy)
-            if not tile or tile.item is not None:
-                continue
-            if self._distance_to_tile(dist_map, (cx, cy)) >= 9999:
-                continue
-            if any(self._distance_to_tile(odm, (cx, cy)) < 9999 for odm in other_dist_maps):
-                shared.append((cx, cy))
-
-        # Prefer counters reachable by both bots; otherwise fall back to any reachable.
-        candidates = shared if shared else [
-            c for c in counters if self._distance_to_tile(dist_map, c) < 9999]
-        for cx, cy in candidates:
-            tile = controller.get_tile(controller.get_team(), cx, cy)
-            if not tile or tile.item is not None:
-                continue
-            d = self._distance_to_tile(dist_map, (cx, cy))
-            if d < best_dist:
-                best_dist = d
-                best = (cx, cy)
-        return best
-
-    def _attempt_handoff(self, controller, bot_id, state, dist_map, other_dist_maps, blocked_tiles, order_id_override=None, item_name_override=None):
-        info = controller.get_bot_state(bot_id)
-        holding = info.get('holding')
-        if not holding:
-            return False
-        counter = self._find_handoff_counter(
-            controller, dist_map, other_dist_maps)
-        if not counter:
-            if self.debug_board:
-                held_name = holding.get('food_name') if holding.get(
-                    'type') == 'Food' else holding.get('type')
-                print(
-                    f"[Bot {bot_id}] Handoff skipped: no counter for {held_name}")
-            return False
-        cx, cy = counter
-        if self.move_to(controller, bot_id, cx, cy, blocked_tiles):
-            if controller.place(bot_id, cx, cy):
-                held_type = holding.get('type')
-                held_name = holding.get(
-                    'food_name') if held_type == 'Food' else None
-                handoff_item = item_name_override or held_name
-                order_id = order_id_override
-                print(
-                    f"[Bot {bot_id}] Handoff placed at ({cx},{cy}) item={held_type}:{held_name}")
-                if state.current_order:
-                    order_id = state.current_order['order_id']
-                    self.add_pending_order(
-                        state, order_id, held_name)
-                    state.current_order = None
-                if handoff_item:
-                    self.last_handoff_items.append(handoff_item)
-                if order_id is not None:
-                    for st in self.bot_states.values():
-                        if st is not state:
-                            st.handoff_queue.append((order_id, handoff_item))
-                # Reset to replan after handoff.
-                state.task_stage = 0
-                state.sub_state = 0
-                state.ingredients_needed = []
-                state.work_counter = None
-                state.plate_counter = None
-                self.handoff_happened_turn = True
-                return True
-            if self.debug_board:
-                tile = controller.get_tile(controller.get_team(), cx, cy)
-                tile_item = getattr(tile, "item", None)
-                if isinstance(tile_item, Food):
-                    item_desc = f"{tile_item.food_name}:{tile_item.cooked_stage}"
-                else:
-                    item_desc = type(
-                        tile_item).__name__ if tile_item else "None"
-                print(
-                    f"[Bot {bot_id}] Handoff place failed at ({cx},{cy}) tile_item={item_desc}")
-        elif self.debug_board:
-            print(
-                f"[Bot {bot_id}] Handoff move toward ({cx},{cy}) blocked")
-        return False
 
     def _location_score(self, pos):
         # Lower score is better (more central to weighted landmarks).
@@ -640,121 +411,6 @@ class BotPlayer:
             if isinstance(tile.item, Food) and tile.item.food_name == ingredient:
                 return (bx, by)
         return None
-
-    def get_world_inventory(self, controller):
-        inventory = []
-        # Counters and plates on counters
-        for cx, cy in self.counters or []:
-            tile = controller.get_tile(controller.get_team(), cx, cy)
-            if not tile:
-                continue
-            if isinstance(tile.item, Food):
-                inventory.append(tile.item.food_name)
-            elif isinstance(tile.item, Plate):
-                for item in tile.item.food:
-                    inventory.append(item.food_name)
-
-        # Cookers (pans)
-        for kx, ky in self.cookers or []:
-            tile = controller.get_tile(controller.get_team(), kx, ky)
-            if tile and isinstance(tile.item, Pan) and tile.item.food:
-                inventory.append(tile.item.food.food_name)
-
-        return inventory
-
-    def find_plate_on_counter(self, controller):
-        for cx, cy in self.counters or []:
-            tile = controller.get_tile(controller.get_team(), cx, cy)
-            if tile and isinstance(tile.item, Plate):
-                return (cx, cy)
-        return None
-
-    def get_plated_inventory(self, controller):
-        plated = []
-        # Plates on counters
-        for cx, cy in self.counters or []:
-            tile = controller.get_tile(controller.get_team(), cx, cy)
-            if tile and isinstance(tile.item, Plate):
-                for item in tile.item.food:
-                    plated.append(item.food_name)
-
-        # Plates in hand
-        for bid in controller.get_team_bot_ids(controller.get_team()):
-            info = controller.get_bot_state(bid)
-            holding = info.get('holding')
-            if holding and holding.get('type') == 'Plate':
-                for item in holding.get('food', []):
-                    plated.append(item['food_name'])
-        return plated
-
-    def recompute_remaining_for_order(self, controller, state, order):
-        required = list(order['required'])
-        plated = self.get_plated_inventory(controller)
-        for item in plated:
-            if item in required:
-                required.remove(item)
-        pending_first = []
-        if state.pending_items:
-            for item in state.pending_items:
-                if item in required:
-                    pending_first.append(item)
-                    required.remove(item)
-        ordered = pending_first + [i for i in required if not self.needs_cooking(i)] + \
-            [i for i in required if self.needs_cooking(i)]
-        state.current_order = order
-        state.ingredients_needed = ordered
-        state.task_stage = 20 if not state.ingredients_needed else 10
-
-    def add_pending_order(self, state, order_id, item_name=None):
-        if order_id is None:
-            return
-        if order_id not in state.pending_order_ids:
-            state.pending_order_ids.append(order_id)
-        if item_name:
-            state.pending_items.append(item_name)
-
-    def clear_pending_order(self, order_id):
-        if order_id is None:
-            return
-        for st in self.bot_states.values():
-            if order_id in st.pending_order_ids:
-                st.pending_order_ids = [
-                    oid for oid in st.pending_order_ids if oid != order_id]
-            if st.pending_items:
-                st.pending_items = []
-
-    def resume_pending_order(self, controller, state, claimed_orders, turn):
-        if not state.pending_order_ids:
-            return False
-        orders = controller.get_orders(controller.get_team())
-        pending_id = state.pending_order_ids[0]
-        pending = next(
-            (o for o in orders if o['order_id'] == pending_id), None)
-        if not pending or not pending['is_active'] or pending['expires_turn'] <= turn:
-            state.pending_order_ids = state.pending_order_ids[1:]
-            state.pending_items = []
-            return False
-
-        required = list(pending['required'])
-        plated = self.get_plated_inventory(controller)
-        for item in plated:
-            if item in required:
-                required.remove(item)
-
-        pending_first = []
-        if state.pending_items:
-            for item in state.pending_items:
-                if item in required:
-                    pending_first.append(item)
-                    required.remove(item)
-
-        state.current_order = pending
-        claimed_orders.add(pending['order_id'])
-        state.ingredients_needed = pending_first + \
-            [i for i in required if not self.needs_cooking(i)] + \
-            [i for i in required if self.needs_cooking(i)]
-        state.task_stage = 1
-        return True
 
     def get_bot_inventory(self, controller, bot_id, state):
         # Get list of ingredients currently possessed by this bot.
@@ -925,17 +581,6 @@ class BotPlayer:
             return 9999
         return min(self._distance_to_tile(dist_map, c) for c in self.counters)
 
-    def _min_handoff_shop_to_cooker(self):
-        if not self.dist_from_shop or not self.dist_from_cookers or not self.shared_handoff_counters:
-            return 9999
-        best = 9999
-        for c in self.shared_handoff_counters:
-            d = self._distance_to_tile(
-                self.dist_from_shop, c) + self._distance_to_tile(self.dist_from_cookers, c)
-            if d < best:
-                best = d
-        return best
-
     def simulate_order_time(self, controller, bot_id, state, order, turn):
         # Lower-bound time estimate to complete the order from current bot state.
         time_left = order['expires_turn'] - turn
@@ -961,12 +606,6 @@ class BotPlayer:
             self.dist_from_counters)
         dist_shop_to_submit = self._distance_to_tile(
             self.dist_from_shop, self.submit_loc)
-        handoff_shop_to_cooker = self._min_handoff_shop_to_cooker()
-
-        if dist_shop_to_cooker >= 9999 and handoff_shop_to_cooker < 9999:
-            dist_shop_to_cooker = handoff_shop_to_cooker
-        if dist_counter_to_cooker >= 9999 and handoff_shop_to_cooker < 9999:
-            dist_counter_to_cooker = handoff_shop_to_cooker
 
         if min(dist_bot_to_shop, dist_shop_to_counter, dist_shop_to_cooker,
                dist_counter_to_cooker, dist_shop_to_submit) >= 9999:
@@ -1004,9 +643,6 @@ class BotPlayer:
         # Calculate heuristic score for an order.
         # Score = Profit + (Penalty * 0.5) + (Urgency Bonus)
         # Returns -float('inf') if impossible to complete in time.
-        my_dist = self.bot_dist_maps.get(bot_id)
-        if my_dist and not self._has_access(my_dist, self.submit_loc):
-            return -float('inf')
 
         # 1. Cost & Profit
         ingredient_cost = 0
@@ -1076,20 +712,6 @@ class BotPlayer:
                 debug_info.append(
                     f"B{bid}:({info['x']},{info['y']})[S{state_val}]")
         print(f"[{team} Turn {turn}] {' | '.join(debug_info)}")
-        if self.debug_board:
-            self.debug_print_bots(controller, bots)
-            self.debug_print_board(controller)
-
-        # Reset per-turn handoff flag.
-        self.handoff_happened_turn = False
-        self.last_handoff_items = []
-
-        # Compute reachability per bot for handoff logic.
-        self.bot_dist_maps = {}
-        for bid in bots:
-            info = controller.get_bot_state(bid)
-            start = (info['x'], info['y'])
-            self.bot_dist_maps[bid] = self._build_dist_map([start])
 
         # Gather shared knowledge
         reserved_counters = set()
@@ -1169,602 +791,6 @@ class BotPlayer:
     # Shared Logic
 
     def run_standard_logic(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles):
-        info = controller.get_bot_state(bot_id)
-        holding = info.get('holding')
-        bx, by = info['x'], info['y']
-
-        my_dist = self.bot_dist_maps.get(bot_id)
-        if not self._is_helper_mode(my_dist):
-            self.run_normal_logic(
-                controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles)
-            return
-
-        other_dist_maps = [
-            dm for bid, dm in self.bot_dist_maps.items() if bid != bot_id]
-        shop_pos = self.choose_shop_for_bot(my_dist, bot_pos=(bx, by))
-        if not shop_pos:
-            return
-        sx, sy = shop_pos
-        ux, uy = self.submit_loc
-
-        # Helper-side behavior on split maps: cook and handoff without ordering.
-        if my_dist and not self._has_access(my_dist, (ux, uy)):
-            if self.debug_board:
-                h_desc = None
-                if holding:
-                    if holding.get('type') == 'Food':
-                        h_desc = f"{holding.get('food_name')}:{holding.get('cooked_stage', 0)}"
-                    else:
-                        h_desc = holding.get('type')
-                print(
-                    f"[Bot {bot_id}] Helper mode holding={h_desc} queue={state.handoff_queue}")
-            if state.handoff_queue:
-                order_id, target_item = state.handoff_queue[0]
-                if holding and holding.get('type') == 'Food':
-                    held_name = holding.get('food_name')
-                    if target_item and held_name != target_item:
-                        # Try to rotate queue to match held item if possible.
-                        match_idx = next(
-                            (i for i, (_, item) in enumerate(
-                                state.handoff_queue) if item == held_name),
-                            None)
-                        if match_idx is not None and match_idx != 0:
-                            state.handoff_queue = state.handoff_queue[match_idx:] + \
-                                state.handoff_queue[:match_idx]
-                            order_id, target_item = state.handoff_queue[0]
-                            if self.debug_board:
-                                print(
-                                    f"[Bot {bot_id}] Helper queue rotated for {held_name}")
-                    if target_item and held_name != target_item:
-                        # Put it back to avoid contaminating queue.
-                        if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles,
-                                                 order_id_override=order_id, item_name_override=held_name):
-                            return
-                    stage = holding.get('cooked_stage', 0)
-                    if stage == 1:
-                        if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles,
-                                                 order_id_override=order_id, item_name_override=target_item):
-                            state.handoff_queue.pop(0)
-                            return
-                    elif stage == 2:
-                        state.task_stage = 99
-                        return
-                    else:
-                        cooker = self.choose_cooker(
-                            controller,
-                            anchor_pos=state.work_counter or state.plate_counter,
-                            bot_pos=(bx, by),
-                            blocked_tiles=blocked_tiles,
-                            want_food=False)
-                        if cooker and self.move_to(controller, bot_id, cooker[0], cooker[1], blocked_tiles):
-                            controller.place(bot_id, cooker[0], cooker[1])
-                        return
-                else:
-                    handoff_food = self._find_handoff_food(
-                        controller, my_dist, require_cookable=True, require_raw=True, item_name=target_item)
-                    if handoff_food and self.move_to(controller, bot_id, handoff_food[0], handoff_food[1], blocked_tiles):
-                        if controller.pickup(bot_id, handoff_food[0], handoff_food[1]):
-                            return
-            if holding and holding.get('type') == 'Food':
-                held_name = holding.get('food_name')
-                stage = holding.get('cooked_stage', 0)
-                if stage == 1:
-                    if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles):
-                        return
-                elif stage == 2:
-                    state.task_stage = 99
-                    return
-                else:
-                    if self.needs_chopping(held_name) and self.needs_cooking(held_name):
-                        if state.task_stage != 12 or not state.ingredients_needed or state.ingredients_needed[0] != held_name:
-                            state.ingredients_needed = [held_name]
-                            state.sub_state = 0
-                            state.task_stage = 12
-                        self.process_chop_cook(
-                            controller, bot_id, state, holding, reserved_counters, blocked_tiles, held_name,
-                            my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=True)
-                        return
-                    if self.needs_cooking(held_name):
-                        if state.task_stage != 12 or not state.ingredients_needed or state.ingredients_needed[0] != held_name:
-                            state.ingredients_needed = [held_name]
-                            state.sub_state = 0
-                            state.task_stage = 12
-                        self.process_cook_only(
-                            controller, bot_id, state, holding, reserved_counters, blocked_tiles, held_name,
-                            my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=True)
-                        return
-                    if self.needs_chopping(held_name):
-                        if state.task_stage != 12 or not state.ingredients_needed or state.ingredients_needed[0] != held_name:
-                            state.ingredients_needed = [held_name]
-                            state.sub_state = 0
-                            state.task_stage = 12
-                        self.process_chop_only(
-                            controller, bot_id, state, holding, reserved_counters, blocked_tiles,
-                            my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=True)
-                        return
-                    if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles):
-                        return
-                    if self.primary_handoff_counter:
-                        hx, hy = self.primary_handoff_counter
-                        self.move_to(controller, bot_id, hx, hy, blocked_tiles)
-                    return
-            else:
-                # If cooked food is ready on a cooker, retrieve it.
-                for kx, ky in self.cookers or []:
-                    if my_dist and not self._has_access(my_dist, (kx, ky)):
-                        continue
-                    tile = controller.get_tile(controller.get_team(), kx, ky)
-                    if tile and isinstance(tile.item, Pan) and tile.item.food:
-                        if tile.item.food.cooked_stage == 1:
-                            if self.move_to(controller, bot_id, kx, ky, blocked_tiles):
-                                controller.take_from_pan(bot_id, kx, ky)
-                            return
-                # If cooking is in progress, stay near the cooker instead of re-picking.
-                for kx, ky in self.cookers or []:
-                    if my_dist and not self._has_access(my_dist, (kx, ky)):
-                        continue
-                    tile = controller.get_tile(controller.get_team(), kx, ky)
-                    if tile and isinstance(tile.item, Pan) and tile.item.food:
-                        if tile.item.food.cooked_stage == 0:
-                            self.move_to(controller, bot_id,
-                                         kx, ky, blocked_tiles)
-                            return
-                # Otherwise, look for new handoff items to cook.
-                handoff_food = self._find_handoff_food(
-                    controller, my_dist, require_cookable=True, require_raw=True)
-                if handoff_food:
-                    print(f"[Bot {bot_id}] Helper pickup at {handoff_food}")
-                if handoff_food and self.move_to(controller, bot_id, handoff_food[0], handoff_food[1], blocked_tiles):
-                    if controller.pickup(bot_id, handoff_food[0], handoff_food[1]):
-                        info2 = controller.get_bot_state(bot_id)
-                        holding2 = info2.get('holding')
-                        if holding2 and holding2.get('type') == 'Food':
-                            state.ingredients_needed = [
-                                holding2.get('food_name')]
-                        else:
-                            state.ingredients_needed = []
-                        state.sub_state = 0
-                        state.task_stage = 12
-                return
-
-        # If a handoff happened this turn, re-evaluate order progress immediately.
-        if self.handoff_happened_turn and my_dist and self._has_access(my_dist, (ux, uy)):
-            if state.current_order:
-                self.recompute_remaining_for_order(
-                    controller, state, state.current_order)
-                return
-            if state.pending_order_ids:
-                if self.resume_pending_order(controller, state, claimed_orders, controller.get_turn()):
-                    return
-            # Try to complete any active order from available inventory.
-            orders = controller.get_orders(controller.get_team())
-            inventory = self.get_world_inventory(controller)
-            for o in orders:
-                if not o['is_active'] or o['expires_turn'] <= controller.get_turn():
-                    continue
-                if o['order_id'] in claimed_orders:
-                    continue
-                required = list(o['required'])
-                for item in inventory:
-                    if item in required:
-                        required.remove(item)
-                if not required:
-                    self.recompute_remaining_for_order(controller, state, o)
-                    claimed_orders.add(o['order_id'])
-                    return
-
-        # Stuck detection
-        if state.task_stage == state.last_state:
-            state.stuck_counter += 1
-            if state.stuck_counter > 10:
-                if state.task_stage == 12 and holding and holding.get('type') == 'Food' and holding.get('cooked_stage', 0) == 0:
-                    if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles):
-                        state.stuck_counter = 0
-                        return
-                print(
-                    f"[Bot {bot_id}] STUCK in state {state.task_stage}, forcing random move")
-                import random
-                dx, dy = random.choice([(0, 1), (0, -1), (1, 0), (-1, 0)])
-                controller.move(bot_id, dx, dy)
-                state.stuck_counter = 0
-                return
-        else:
-            state.stuck_counter = 0
-        state.last_state = state.task_stage
-
-        # Burnt food check
-        if holding and holding.get('type') == 'Food' and holding.get('cooked_stage') == 2:
-            state.task_stage = 99
-
-        # State 0: Pick order
-        if state.task_stage == 0:
-            state.ingredients_needed = []
-            state.plate_counter = None
-            state.work_counter = None
-            state.sub_state = 0
-            state.current_order = None
-
-            # Helper mode for split maps: pick up cookable handoff items if no shop access.
-            if not holding and my_dist and not self._can_access_any_shop(my_dist):
-                handoff_food = self._find_handoff_food(
-                    controller, my_dist, require_cookable=True, require_raw=True)
-                if handoff_food:
-                    hx, hy = handoff_food
-                    if self.move_to(controller, bot_id, hx, hy, blocked_tiles):
-                        if controller.pickup(bot_id, hx, hy):
-                            info2 = controller.get_bot_state(bot_id)
-                            holding2 = info2.get('holding')
-                            if holding2 and holding2.get('type') == 'Food':
-                                state.ingredients_needed = [
-                                    holding2.get('food_name')]
-                            else:
-                                state.ingredients_needed = []
-                            state.task_stage = 12
-                            return
-
-            if state.pending_order_ids:
-                if self.resume_pending_order(controller, state, claimed_orders, controller.get_turn()):
-                    return
-                if len(state.pending_order_ids) >= 3:
-                    # Stop taking new orders until pending ones are cleared.
-                    return
-
-            orders = controller.get_orders(controller.get_team())
-            turn = controller.get_turn()
-            team_money = controller.get_team_money(controller.get_team())
-
-            best = None
-            best_score = -float('inf')
-
-            for o in orders:
-                # Filter inactive, expired, or claimed by OTHER bots
-                if o['is_active'] and o['expires_turn'] > turn:
-                    if o['order_id'] in claimed_orders:
-                        continue
-
-                    score = self.calculate_order_heuristic(
-                        controller, bot_id, state, o, turn, team_money)
-
-                    if score > best_score:
-                        best_score = score
-                        best = o
-
-            if best:
-                state.current_order = best
-                # Claim it immediately for subsequent bots in this turn
-                claimed_orders.add(best['order_id'])
-
-                req = list(best['required'])
-                # Non-cooking first
-                state.ingredients_needed = [i for i in req if not self.needs_cooking(i)] + \
-                    [i for i in req if self.needs_cooking(i)]
-                state.task_stage = 1
-
-        # State 1: Ensure pan
-        elif state.task_stage == 1:
-            if any(self.needs_cooking(i) for i in state.ingredients_needed):
-                if self.get_free_cooker(controller):
-                    state.task_stage = 2
-                else:
-                    cooker = self.get_cooker_needing_pan(controller)
-                    if cooker:
-                        kx, ky = cooker
-                        if holding:
-                            if holding.get('type') == 'Pan':
-                                if self.move_to(controller, bot_id, kx, ky, blocked_tiles):
-                                    controller.place(bot_id, kx, ky)
-                                    state.task_stage = 2
-                            else:
-                                state.task_stage = 99
-                        else:
-                            if self.move_to(controller, bot_id, sx, sy, blocked_tiles):
-                                if controller.get_team_money(controller.get_team()) >= ShopCosts.PAN.buy_cost:
-                                    controller.buy(
-                                        bot_id, ShopCosts.PAN, sx, sy)
-                    else:
-                        # No cooker available/needing pan? Assume setup is ok or wait
-                        state.task_stage = 2
-            else:
-                state.task_stage = 2
-
-        # State 2: Buy/place plate
-        elif state.task_stage == 2:
-            if not state.plate_counter:
-                existing_plate = self.find_plate_on_counter(controller)
-                if existing_plate:
-                    state.plate_counter = existing_plate
-                    state.task_stage = 10
-                    return
-            if holding:
-                if holding.get('type') == 'Plate':
-                    if not state.plate_counter:
-                        anchor = self.cooker_priority[0] if self.cooker_priority else None
-                        state.plate_counter = self.get_free_counter(
-                            controller,
-                            exclude=reserved_counters,
-                            bot_pos=(bx, by),
-                            blocked_tiles=blocked_tiles,
-                            anchor_pos=anchor)
-
-                    if state.plate_counter:
-                        if my_dist and not self._has_access(my_dist, state.plate_counter):
-                            if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles):
-                                return
-                            state.plate_counter = None
-                            state.task_stage = 2
-                            return
-                        # Reserve it
-                        reserved_counters.add(state.plate_counter)
-
-                        px, py = state.plate_counter
-                        adjacent = self.move_to(
-                            controller, bot_id, px, py, blocked_tiles)
-                        if adjacent:
-                            if controller.place(bot_id, px, py):
-                                state.task_stage = 10
-                    else:
-                        print(
-                            f"Error: No plate counter available for Bot {bot_id}")
-                else:
-                    state.task_stage = 99
-            else:
-                adjacent = self.move_to(
-                    controller, bot_id, sx, sy, blocked_tiles)
-                money = controller.get_team_money(controller.get_team())
-                if adjacent:
-                    if money >= ShopCosts.PLATE.buy_cost:
-                        controller.buy(bot_id, ShopCosts.PLATE, sx, sy)
-
-        # State 10: Next ingredient
-        elif state.task_stage == 10:
-            if not state.ingredients_needed:
-                state.task_stage = 20
-            else:
-                state.sub_state = 0
-                state.work_counter = None
-                state.task_stage = 11
-
-        # State 11: Buy ingredient
-        elif state.task_stage == 11:
-            if not state.ingredients_needed:
-                state.task_stage = 20
-                return
-
-            ing = state.ingredients_needed[0]
-            ft = self.get_food_type(ing)
-
-            if holding:
-                if holding.get('type') == 'Food':
-                    # verify it's the right food
-                    if holding.get('food_name') == ing:
-                        state.task_stage = 12
-                    else:
-                        state.task_stage = 99
-                else:
-                    state.task_stage = 99
-            else:
-                # CHECK IF WE ALREADY HAVE IT ON MAP
-                loc, is_cooking = self.find_existing_ingredient(
-                    controller, ing)
-
-                if loc:
-                    if my_dist and not self._has_access(my_dist, loc):
-                        # Ignore unreachable items; try to get it ourselves or handoff.
-                        loc = None
-                        is_cooking = False
-                    if loc:
-                        if is_cooking:
-                            # Cooking in execution
-                            if self.needs_chopping(ing):
-                                state.sub_state = 4
-                            else:
-                                state.sub_state = 1
-                        else:
-                            tile = controller.get_tile(
-                                controller.get_team(), *loc)
-                            if self.needs_cooking(ing) and my_dist and not self._can_access_any_cooker(my_dist):
-                                # Can't cook on this side; ignore raw handoff items, but allow cooked pickups.
-                                if tile and isinstance(tile.item, Food) and tile.item.cooked_stage == 1:
-                                    if self.debug_board:
-                                        print(
-                                            f"[Bot {bot_id}] Accept cooked {tile.item.food_name} at {loc}")
-                                else:
-                                    if self.debug_board and tile and isinstance(tile.item, Food):
-                                        print(
-                                            f"[Bot {bot_id}] Ignore raw {tile.item.food_name} at {loc} (no cooker access)")
-                                    loc = None
-                                    is_cooking = False
-                            if loc:
-                                state.work_counter = loc
-                                reserved_counters.add(loc)
-
-                                # Check status
-                                if tile and isinstance(tile.item, Food):
-                                    is_chopped = tile.item.chopped
-
-                                    if self.needs_chopping(ing):
-                                        if is_chopped:
-                                            state.sub_state = 2  # Pickup chopped
-                                        else:
-                                            state.sub_state = 1  # Chop
-                                    else:
-                                        state.sub_state = 0
-
-                        if loc:
-                            state.task_stage = 12
-                            return
-
-                # Buy only if not found
-                if my_dist and not self._has_access(my_dist, (sx, sy)):
-                    # Can't access shop; try to handoff if holding something.
-                    if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles):
-                        return
-                cost = ft.buy_cost
-                money = controller.get_team_money(controller.get_team())
-                if money < cost:
-                    # Only use boxes when we can't afford the shop item.
-                    box_loc = self.find_box_with_ingredient(controller, ing)
-                    if box_loc:
-                        bx2, by2 = box_loc
-                        if my_dist and not self._has_access(my_dist, (bx2, by2)):
-                            if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles):
-                                return
-                        if self.move_to(controller, bot_id, bx2, by2, blocked_tiles):
-                            if controller.pickup(bot_id, bx2, by2):
-                                state.task_stage = 12
-                        return
-
-                if self.move_to(controller, bot_id, sx, sy, blocked_tiles):
-                    if money >= cost:
-                        controller.buy(bot_id, ft, sx, sy)
-                        state.task_stage = 12
-
-        # State 12: Process
-        elif state.task_stage == 12:
-            if not state.ingredients_needed:
-                state.task_stage = 20
-                return
-
-            ing = state.ingredients_needed[0]
-            chop = self.needs_chopping(ing)
-            cook = self.needs_cooking(ing)
-            if self.debug_board:
-                held_desc = None
-                if holding:
-                    if holding.get('type') == 'Food':
-                        held_desc = f"{holding.get('food_name')}:{holding.get('cooked_stage', 0)}"
-                    else:
-                        held_desc = holding.get('type')
-                can_cook = self._can_access_any_cooker(
-                    my_dist) if my_dist else False
-                can_shop = self._can_access_any_shop(
-                    my_dist) if my_dist else False
-                can_submit = self._has_access(
-                    my_dist, (ux, uy)) if my_dist else False
-                print(
-                    f"[Bot {bot_id}] State12 ing={ing} sub={state.sub_state} holding={held_desc} can_cook={can_cook} can_shop={can_shop} can_submit={can_submit}")
-
-            if chop and cook:
-                self.process_chop_cook(
-                    controller, bot_id, state, holding, reserved_counters, blocked_tiles, ing,
-                    my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=True)
-            elif cook:
-                self.process_cook_only(
-                    controller, bot_id, state, holding, reserved_counters, blocked_tiles, ing,
-                    my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=True)
-            elif chop:
-                self.process_chop_only(
-                    controller, bot_id, state, holding, reserved_counters, blocked_tiles,
-                    my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=True)
-            else:
-                state.task_stage = 13
-
-        # State 13: Add to plate
-        elif state.task_stage == 13:
-            if holding and holding.get('type') == 'Food':
-                if holding.get('cooked_stage', 0) == 1:
-                    if my_dist and not self._has_access(my_dist, (ux, uy)):
-                        if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles):
-                            return
-            if not state.plate_counter:
-                state.task_stage = 2
-                return
-
-            px, py = state.plate_counter
-            if my_dist and not self._has_access(my_dist, (px, py)):
-                if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles):
-                    return
-                state.plate_counter = None
-                state.task_stage = 2
-                return
-            tile = controller.get_tile(controller.get_team(), px, py)
-            if not tile or not isinstance(tile.item, Plate):
-                # Plate was taken or moved; re-acquire a new plate.
-                state.plate_counter = None
-                state.task_stage = 2
-                return
-
-            if self.move_to(controller, bot_id, px, py, blocked_tiles):
-                if controller.add_food_to_plate(bot_id, px, py):
-                    if state.ingredients_needed:
-                        state.ingredients_needed.pop(0)
-                    state.task_stage = 10
-
-        # State 20: Pickup plate
-        elif state.task_stage == 20:
-            if holding:
-                if holding.get('type') == 'Plate':
-                    state.task_stage = 21
-                else:
-                    state.task_stage = 99
-            else:
-                if not state.plate_counter:
-                    state.task_stage = 2
-                    return
-
-                px, py = state.plate_counter
-                if my_dist and not self._has_access(my_dist, (px, py)):
-                    state.plate_counter = None
-                    state.task_stage = 0
-                    return
-                tile = controller.get_tile(controller.get_team(), px, py)
-                if not tile or not isinstance(tile.item, Plate):
-                    # Plate missing; go buy/place another.
-                    state.plate_counter = None
-                    state.task_stage = 2
-                    return
-
-                if self.move_to(controller, bot_id, px, py, blocked_tiles):
-                    if controller.pickup(bot_id, px, py):
-                        state.task_stage = 21
-
-        # State 21: Submit
-        elif state.task_stage == 21:
-            if holding and holding.get('type') != 'Plate':
-                state.task_stage = 99
-                return
-            if not holding:
-                state.task_stage = 20
-                return
-
-            if my_dist and not self._has_access(my_dist, (ux, uy)):
-                if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles):
-                    return
-            if self.move_to(controller, bot_id, ux, uy, blocked_tiles):
-                if controller.can_submit(bot_id, ux, uy):
-                    if controller.submit(bot_id, ux, uy):
-                        print(f"[Bot {bot_id}] submit OK")
-                        state.pending_order_id = None
-                        state.pending_items = []
-                        state.task_stage = 0
-                    else:
-                        state.task_stage = 20
-                else:
-                    print(
-                        f"[Bot {bot_id}] submit blocked: can_submit=False holding={holding}")
-
-        # State 99: Trash
-        elif state.task_stage == 99:
-            if holding and self.trash_loc:
-                tx, ty = self.trash_loc
-                if self.move_to(controller, bot_id, tx, ty, blocked_tiles):
-                    controller.trash(bot_id, tx, ty)
-                    state.task_stage = 0
-                    state.sub_state = 0
-                    state.ingredients_needed = []
-                    state.plate_counter = None
-                    state.work_counter = None
-                    state.current_order = None
-            else:
-                state.task_stage = 0
-                state.sub_state = 0
-                state.ingredients_needed = []
-                state.plate_counter = None
-                state.work_counter = None
-                state.current_order = None
-
-    def run_normal_logic(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles):
-        # Snapshot3 normal-map logic (no helper/handoff behaviors).
         info = controller.get_bot_state(bot_id)
         holding = info.get('holding')
         bx, by = info['x'], info['y']
@@ -2072,7 +1098,7 @@ class BotPlayer:
                 state.work_counter = None
                 state.current_order = None
 
-    def process_chop_only(self, controller, bot_id, state, holding, reserved, blocked, my_dist=None, other_dist_maps=None, helper_mode=False):
+    def process_chop_only(self, controller, bot_id, state, holding, reserved, blocked):
         if not state.work_counter:
             # Exclude global reserved + own plate counter
             exclude = set(reserved)
@@ -2089,12 +1115,6 @@ class BotPlayer:
                 anchor_pos=anchor)
 
         if not state.work_counter:
-            state.task_stage = 99
-            return
-
-        if helper_mode and my_dist and not self._has_access(my_dist, state.work_counter):
-            if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps or [], blocked):
-                return
             state.task_stage = 99
             return
 
@@ -2137,7 +1157,7 @@ class BotPlayer:
                         state.task_stage = 13
                         state.sub_state = 0
 
-    def process_cook_only(self, controller, bot_id, state, holding, reserved, blocked, ing, my_dist=None, other_dist_maps=None, helper_mode=False):
+    def process_cook_only(self, controller, bot_id, state, holding, reserved, blocked, ing):
         if state.sub_state == 0:  # Place on cooker
             if holding:
                 if holding.get('type') == 'Food':
@@ -2147,16 +1167,6 @@ class BotPlayer:
                         return
                     elif stage == 2:
                         state.task_stage = 99
-                        return
-
-                    if helper_mode and my_dist and not any(
-                            self._has_access(my_dist, c) for c in self.cookers or []):
-                        # No cooker access on this side; handoff raw cookable items.
-                        if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps or [], blocked):
-                            return
-                        if self.primary_handoff_counter:
-                            hx, hy = self.primary_handoff_counter
-                            self.move_to(controller, bot_id, hx, hy, blocked)
                         return
 
                     bot_state = controller.get_bot_state(bot_id)
@@ -2181,12 +1191,6 @@ class BotPlayer:
 
                     if cooker:
                         kx, ky = cooker
-                        if helper_mode:
-                            step = self.get_next_step_astar(
-                                controller, (bot_state['x'], bot_state['y']), kx, ky, blocked=blocked)
-                            if step is None:
-                                if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps or [], blocked):
-                                    return
                         if self.move_to(controller, bot_id, kx, ky, blocked):
                             if controller.place(bot_id, kx, ky):
                                 state.sub_state = 1
@@ -2264,7 +1268,7 @@ class BotPlayer:
             state.task_stage = 11
             state.sub_state = 0
 
-    def process_chop_cook(self, controller, bot_id, state, holding, reserved, blocked, ing, my_dist=None, other_dist_maps=None, helper_mode=False):
+    def process_chop_cook(self, controller, bot_id, state, holding, reserved, blocked, ing):
         if not state.work_counter:
             exclude = set(reserved)
             if state.plate_counter:
@@ -2279,12 +1283,6 @@ class BotPlayer:
                 anchor_pos=anchor)
 
         if not state.work_counter:
-            state.task_stage = 99
-            return
-
-        if helper_mode and my_dist and not self._has_access(my_dist, state.work_counter):
-            if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps or [], blocked):
-                return
             state.task_stage = 99
             return
 
@@ -2347,15 +1345,6 @@ class BotPlayer:
                         state.sub_state = 0
                         return
 
-                    if helper_mode and my_dist and not any(
-                            self._has_access(my_dist, c) for c in self.cookers or []):
-                        if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps or [], blocked):
-                            return
-                        if self.primary_handoff_counter:
-                            hx, hy = self.primary_handoff_counter
-                            self.move_to(controller, bot_id, hx, hy, blocked)
-                        return
-
                     bot_state = controller.get_bot_state(bot_id)
                     anchor = state.work_counter or state.plate_counter
                     cooker = None
@@ -2378,12 +1367,6 @@ class BotPlayer:
 
                     if cooker:
                         kx, ky = cooker
-                        if helper_mode:
-                            step = self.get_next_step_astar(
-                                controller, (bot_state['x'], bot_state['y']), kx, ky, blocked=blocked)
-                            if step is None:
-                                if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps or [], blocked):
-                                    return
                         if self.move_to(controller, bot_id, kx, ky, blocked):
                             if controller.place(bot_id, kx, ky):
                                 state.sub_state = 4
