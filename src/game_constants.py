@@ -102,7 +102,7 @@ class GameConstants(metaclass = FrozenMeta):
 
   #time it takes to cook and burn; [0, 20) uncooked, [20, 40) cooked, [40,..) burnt
   COOK_PROGRESS = 20
-  BURN_PROGRESS = 40
+  BURN_PROGRESS =40
 
   PLATE_WASH_PROGRESS = 2
 
