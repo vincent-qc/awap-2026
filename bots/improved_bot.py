@@ -22,6 +22,8 @@ class BotState:
         self.pending_order_ids = []
         self.pending_items = []
         self.handoff_queue = []
+        self.assist_order_id = None
+        self.assist_item = None
 
         # Stuck detection
         self.stuck_counter = 0
@@ -31,6 +33,8 @@ class BotState:
 class BotPlayer:
     HEURISTIC_EXPIRY = "expiry"
     HEURISTIC_INGREDIENTS = "ingredients"
+    HEURISTIC_PROFIT = "profit"
+    ENDGAME_ASSIST_TURNS = 50
 
     def __init__(self, map_copy):
         self.map = map_copy
@@ -283,6 +287,122 @@ class BotPlayer:
                 controller.move(bot_id, step[0], step[1])
             return True
         return False
+
+    def _nearest_idle_safe_tile(self, bot_pos, dist_map, blocked_tiles):
+        if not self.cached_map:
+            return None
+        m = self.cached_map
+        best = None
+        best_dist = 9999
+        for x in range(m.width):
+            for y in range(m.height):
+                if not m.is_tile_walkable(x, y):
+                    continue
+                pos = (x, y)
+                if pos in self.critical_tiles:
+                    continue
+                if blocked_tiles and pos in blocked_tiles:
+                    continue
+                if dist_map is not None:
+                    d = self._distance_to_tile(dist_map, pos)
+                else:
+                    d = self._chebyshev(bot_pos, pos)
+                if d < best_dist:
+                    best_dist = d
+                    best = pos
+        if dist_map is not None and best_dist >= 9999:
+            return None
+        return best
+
+    def _relocate_if_idle(self, controller, bot_id, state, bot_pos, dist_map, blocked_tiles):
+        if state.current_order or state.pending_order_ids:
+            return False
+        info = controller.get_bot_state(bot_id)
+        holding = info.get('holding')
+        if holding is not None:
+            return False
+        if state.task_stage != 0:
+            return False
+        if bot_pos not in self.critical_tiles:
+            return False
+        target = self._nearest_idle_safe_tile(bot_pos, dist_map, blocked_tiles)
+        if not target or target == bot_pos:
+            return False
+        step = self.get_next_step_astar(
+            controller, bot_pos, target[0], target[1], blocked=blocked_tiles)
+        if step and step != (0, 0):
+            controller.move(bot_id, step[0], step[1])
+            return True
+        return False
+
+    def _is_idle_bot(self, controller, bot_id, state):
+        info = controller.get_bot_state(bot_id)
+        holding = info.get('holding')
+        if holding is not None:
+            return False
+        if state.current_order or state.pending_order_ids:
+            return False
+        if state.task_stage != 0:
+            return False
+        if state.ingredients_needed:
+            return False
+        return True
+
+    def _clear_assist_state(self, state):
+        state.assist_order_id = None
+        state.assist_item = None
+
+    def _assist_target_active(self, controller, state):
+        if not state.assist_order_id or not state.assist_item:
+            return False
+        orders = controller.get_orders(controller.get_team())
+        order = next(
+            (o for o in orders if o['order_id'] == state.assist_order_id), None)
+        if not order or not order['is_active'] or order['expires_turn'] <= controller.get_turn():
+            return False
+        if state.assist_item not in order.get('required', []):
+            return False
+        return True
+
+    def _assign_endgame_assist(self, controller, bots):
+        turns_left = GameConstants.TOTAL_TURNS - controller.get_turn()
+        if turns_left > self.ENDGAME_ASSIST_TURNS:
+            for bid in bots:
+                st = self.bot_states.get(bid)
+                if st:
+                    self._clear_assist_state(st)
+            return
+
+        idle_bots = []
+        active_bots = []
+        for bid in bots:
+            st = self.bot_states.get(bid)
+            if not st:
+                continue
+            if self._is_idle_bot(controller, bid, st):
+                idle_bots.append(bid)
+            else:
+                active_bots.append(bid)
+
+        if len(idle_bots) == 1 and len(active_bots) == 1:
+            helper_id = idle_bots[0]
+            leader_id = active_bots[0]
+            helper_state = self.bot_states.get(helper_id)
+            leader_state = self.bot_states.get(leader_id)
+            if helper_state and leader_state and leader_state.current_order and leader_state.ingredients_needed:
+                helper_state.assist_order_id = leader_state.current_order['order_id']
+                helper_state.assist_item = leader_state.ingredients_needed[0]
+                for bid in bots:
+                    if bid != helper_id:
+                        st = self.bot_states.get(bid)
+                        if st:
+                            self._clear_assist_state(st)
+                return
+
+        for bid in bots:
+            st = self.bot_states.get(bid)
+            if st:
+                self._clear_assist_state(st)
 
     def get_next_step_astar(self, controller, start, target_x, target_y, blocked=None):
         # Get next step towards target using A* with Manhattan heuristic. Returns (dx, dy) or None.
@@ -1231,16 +1351,19 @@ class BotPlayer:
         return sim_time + safety_buffer <= time_left
 
     def _order_has_positive_margin(self, order):
-        reward = order.get('reward', 0)
         penalty = order.get('penalty', 0)
+        # Skip only if doing the order is worse than letting it expire.
+        return self._order_net_profit(order) >= -penalty
+
+    def _order_net_profit(self, order):
+        reward = order.get('reward', 0)
         required = order.get('required', [])
         total_cost = 0
         for ing in required:
             ft = self.get_food_type(ing)
             if ft is not None:
                 total_cost += ft.buy_cost
-        # Skip only if doing the order is worse than letting it expire.
-        return (reward - total_cost) >= -penalty
+        return reward - total_cost
 
     def calculate_order_heuristic(self, controller, bot_id, state, order, turn, team_money, heuristic=None):
         # Returns -float('inf') if impossible to complete in time.
@@ -1254,6 +1377,11 @@ class BotPlayer:
             # Primary key: earliest expiration.
             # Secondary key: fewer ingredients.
             return (-time_left * 1_000_000) - ingredient_count
+
+        if heuristic == self.HEURISTIC_PROFIT:
+            # Primary key: higher profit. Secondary key: fewer ingredients.
+            net_profit = self._order_net_profit(order)
+            return (net_profit * 1_000_000) - ingredient_count
 
         # Default: strictly fewer ingredients, time as tie-breaker.
         return (-ingredient_count * 1_000_000) - time_left
@@ -1332,6 +1460,9 @@ class BotPlayer:
                 if st.current_order:
                     claimed_orders.add(st.current_order['order_id'])
 
+        # Endgame assist: idle bot helps active bot finish ingredients.
+        self._assign_endgame_assist(controller, bots)
+
         # Execute each bot
         # Determine bot index to assign roles
         team_bots = sorted(bots)
@@ -1345,6 +1476,8 @@ class BotPlayer:
                 pos for bid, pos in all_bot_positions.items() if bid != bot_id}
 
             my_state = self.bot_states[bot_id]
+            pre_info = controller.get_bot_state(bot_id)
+            pre_pos = (pre_info['x'], pre_info['y'])
 
             # Identify which bot is which
             is_bot_1 = (bot_id == team_bots[0])
@@ -1366,6 +1499,13 @@ class BotPlayer:
                     controller, bot_id, my_state, reserved_counters, reserved_cookers,
                     claimed_orders, other_bots_locs,
                     order_heuristic=self.HEURISTIC_INGREDIENTS)
+
+            post_info = controller.get_bot_state(bot_id)
+            post_pos = (post_info['x'], post_info['y'])
+            if post_pos == pre_pos:
+                self._relocate_if_idle(
+                    controller, bot_id, my_state, post_pos,
+                    self.bot_dist_maps.get(bot_id), other_bots_locs)
 
     # Bot 1 Behavior
 
@@ -1393,6 +1533,8 @@ class BotPlayer:
         bx, by = info['x'], info['y']
 
         my_dist = self.bot_dist_maps.get(bot_id)
+        other_dist_maps = [
+            dm for bid, dm in self.bot_dist_maps.items() if bid != bot_id]
         my_reserved_counters = set()
         if state.plate_counter:
             my_reserved_counters.add(state.plate_counter)
@@ -1405,8 +1547,15 @@ class BotPlayer:
                 controller, bot_id, state, reserved_counters, reserved_cookers, claimed_orders, blocked_tiles, order_heuristic)
             return
 
-        other_dist_maps = [
-            dm for bid, dm in self.bot_dist_maps.items() if bid != bot_id]
+        if state.assist_item:
+            if not self._assist_target_active(controller, state):
+                self._clear_assist_state(state)
+            elif state.task_stage == 0 and not holding and not state.current_order:
+                state.ingredients_needed = [state.assist_item]
+                state.sub_state = 0
+                state.work_counter = None
+                state.plate_counter = None
+                state.task_stage = 11
         shop_pos = self.choose_shop_for_bot(my_dist, bot_pos=(bx, by))
         if not shop_pos:
             return
@@ -1905,6 +2054,14 @@ class BotPlayer:
 
         # State 13: Add to plate
         elif state.task_stage == 13:
+            if state.assist_item and holding and holding.get('type') == 'Food':
+                if holding.get('food_name') == state.assist_item:
+                    if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles,
+                                             order_id_override=state.assist_order_id, item_name_override=state.assist_item):
+                        self._clear_assist_state(state)
+                        return
+                else:
+                    self._clear_assist_state(state)
             if holding and holding.get('type') == 'Food':
                 if holding.get('cooked_stage', 0) == 1:
                     if my_dist and not self._has_access(my_dist, (ux, uy)):
@@ -2016,6 +2173,8 @@ class BotPlayer:
         holding = info.get('holding')
         bx, by = info['x'], info['y']
         my_dist = self.bot_dist_maps.get(bot_id)
+        other_dist_maps = [
+            dm for bid, dm in self.bot_dist_maps.items() if bid != bot_id]
         my_reserved_counters = set()
         if state.plate_counter:
             my_reserved_counters.add(state.plate_counter)
@@ -2025,6 +2184,16 @@ class BotPlayer:
 
         sx, sy = self.shop_loc
         ux, uy = self.submit_loc
+
+        if state.assist_item:
+            if not self._assist_target_active(controller, state):
+                self._clear_assist_state(state)
+            elif state.task_stage == 0 and not holding and not state.current_order:
+                state.ingredients_needed = [state.assist_item]
+                state.sub_state = 0
+                state.work_counter = None
+                state.plate_counter = None
+                state.task_stage = 11
 
         # Stuck detection
         if state.task_stage == state.last_state:
@@ -2256,6 +2425,14 @@ class BotPlayer:
 
         # State 13: Add to plate
         elif state.task_stage == 13:
+            if state.assist_item and holding and holding.get('type') == 'Food':
+                if holding.get('food_name') == state.assist_item:
+                    if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles,
+                                             order_id_override=state.assist_order_id, item_name_override=state.assist_item):
+                        self._clear_assist_state(state)
+                        return
+                else:
+                    self._clear_assist_state(state)
             if not state.plate_counter:
                 state.task_stage = 2
                 return
