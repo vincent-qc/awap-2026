@@ -11,6 +11,19 @@ from robot_controller import RobotController
 from item import Pan, Plate, Food
 
 
+class BotState:
+    def __init__(self):
+        self.state = 0
+        self.sub_state = 0
+        self.ingredients_needed = []
+        self.plate_counter = None
+        self.work_counter = None
+        self.current_order = None
+        
+        # Stuck detection
+        self.stuck_counter = 0
+        self.last_state = -1
+
 class BotPlayer:
     def __init__(self, map_copy):
         self.map = map_copy
@@ -22,16 +35,8 @@ class BotPlayer:
         self.submit_loc = None
         self.trash_loc = None
         
-        # State
-        self.state = 0
-        self.sub_state = 0
-        self.ingredients_needed = []
-        self.plate_counter = None
-        self.work_counter = None
-        
-        # Stuck detection
-        self.stuck_counter = 0
-        self.last_state = -1
+        # Bot States: map bot_id -> BotState
+        self.bot_states = {}
 
     def _cache_locations(self, controller):
         """Cache all locations once at start."""
@@ -94,7 +99,7 @@ class BotPlayer:
                     queue.append((nx, ny, step))
         return None
 
-    def _move_to(self, controller, bot_id, target_x, target_y):
+    def _move_to(self, controller, bot_id, target_x, target_y, blocked_tiles=None):
         """Move towards target. Returns True if adjacent."""
         state = controller.get_bot_state(bot_id)
         bx, by = state['x'], state['y']
@@ -102,12 +107,12 @@ class BotPlayer:
         if max(abs(bx - target_x), abs(by - target_y)) <= 1:
             return True
         
-        step = self._bfs_step(controller, (bx, by), target_x, target_y)
+        step = self._bfs_step(controller, (bx, by), target_x, target_y, blocked=blocked_tiles)
         if step and step != (0, 0):
             controller.move(bot_id, step[0], step[1])
         return False
 
-    def _get_free_counter(self, controller, exclude=None, bot_pos=None):
+    def _get_free_counter(self, controller, exclude=None, bot_pos=None, blocked_tiles=None):
         """Find empty counter that is reachable."""
         if exclude is None:
             exclude = set()
@@ -125,7 +130,7 @@ class BotPlayer:
             if tile and tile.item is None:
                 # Check if reachable (can find path)
                 if bot_pos:
-                    step = self._bfs_step(controller, bot_pos, cx, cy)
+                    step = self._bfs_step(controller, bot_pos, cx, cy, blocked=blocked_tiles)
                     if step is not None:
                         return (cx, cy)
                 else:
@@ -135,7 +140,7 @@ class BotPlayer:
         for cx, cy in counters:
             if (cx, cy) not in exclude:
                 if bot_pos:
-                    step = self._bfs_step(controller, bot_pos, cx, cy)
+                    step = self._bfs_step(controller, bot_pos, cx, cy, blocked=blocked_tiles)
                     if step is not None:
                         return (cx, cy)
                 else:
@@ -190,53 +195,96 @@ class BotPlayer:
         if not bots:
             return
         
-        # Debug: print all bot positions
-        turn = controller.get_turn()
-        team = controller.get_team().name
-        positions = []
-        for bid in bots:
-            info = controller.get_bot_state(bid)
-            positions.append(f"Bot{bid}:({info['x']},{info['y']})")
-        print(f"[{team} Turn {turn}] {' | '.join(positions)} | State={self.state} SubState={self.sub_state}")
-        
         self._cache_locations(controller)
         if not self.shop_loc or not self.submit_loc:
             return
-        
-        bot_id = bots[0]
-        self._run_bot(controller, bot_id)
 
-    def _run_bot(self, controller, bot_id):
+        # Initialize state for new bots
+        for bot_id in bots:
+            if bot_id not in self.bot_states:
+                self.bot_states[bot_id] = BotState()
+                
+        # Debug: print all bot states
+        turn = controller.get_turn()
+        team = controller.get_team().name
+        debug_info = []
+        for bid in bots:
+            if bid in self.bot_states:
+                info = controller.get_bot_state(bid)
+                state_val = self.bot_states[bid].state
+                debug_info.append(f"B{bid}:({info['x']},{info['y']})[S{state_val}]")
+        print(f"[{team} Turn {turn}] {' | '.join(debug_info)}")
+
+        # Gather shared knowledge
+        reserved_counters = set()
+        claimed_orders = set()
+        all_bot_positions = {}
+        
+        for bid in bots:
+            # Positions
+            b_info = controller.get_bot_state(bid)
+            all_bot_positions[bid] = (b_info['x'], b_info['y'])
+            
+            # Reserved resources
+            if bid in self.bot_states:
+                st = self.bot_states[bid]
+                if st.plate_counter:
+                    reserved_counters.add(st.plate_counter)
+                if st.work_counter:
+                    reserved_counters.add(st.work_counter)
+                if st.current_order:
+                    claimed_orders.add(st.current_order['order_id'])
+
+        # Execute each bot
+        for bot_id in bots:
+            if bot_id not in self.bot_states: continue
+
+            # Exclude this bot from blocked tiles logic
+            other_bots_locs = {pos for bid, pos in all_bot_positions.items() if bid != bot_id}
+            
+            # Exclude this bot's own resources from exclusion list
+            my_state = self.bot_states[bot_id]
+            my_reserved = set()
+            if my_state.plate_counter: my_reserved.add(my_state.plate_counter)
+            if my_state.work_counter: my_reserved.add(my_state.work_counter)
+            
+            others_reserved_counters = reserved_counters - my_reserved
+            
+            self._run_bot(controller, bot_id, my_state, others_reserved_counters, claimed_orders, other_bots_locs)
+
+    def _run_bot(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles):
         info = controller.get_bot_state(bot_id)
         holding = info.get('holding')
+        bx, by = info['x'], info['y']
         
         sx, sy = self.shop_loc
         ux, uy = self.submit_loc
         
-        # Stuck detection: move random if stuck instead of reset
-        if self.state == self.last_state:
-            self.stuck_counter += 1
-            if self.stuck_counter > 10:
-                print(f"[Bot] STUCK in state {self.state}, forcing random move")
+        # Stuck detection
+        if state.state == state.last_state:
+            state.stuck_counter += 1
+            if state.stuck_counter > 10:
+                print(f"[Bot {bot_id}] STUCK in state {state.state}, forcing random move")
                 import random
                 dx, dy = random.choice([(0,1), (0,-1), (1,0), (-1,0)])
                 controller.move(bot_id, dx, dy)
-                self.stuck_counter = 0
+                state.stuck_counter = 0
                 return
         else:
-            self.stuck_counter = 0
-        self.last_state = self.state
+            state.stuck_counter = 0
+        state.last_state = state.state
         
         # Burnt food check
         if holding and holding.get('type') == 'Food' and holding.get('cooked_stage') == 2:
-            self.state = 99
+            state.state = 99
         
         # State 0: Pick order
-        if self.state == 0:
-            self.ingredients_needed = []
-            self.plate_counter = None
-            self.work_counter = None
-            self.sub_state = 0
+        if state.state == 0:
+            state.ingredients_needed = []
+            state.plate_counter = None
+            state.work_counter = None
+            state.sub_state = 0
+            state.current_order = None
             
             orders = controller.get_orders(controller.get_team())
             turn = controller.get_turn()
@@ -244,7 +292,11 @@ class BotPlayer:
             best = None
             best_score = 999
             for o in orders:
+                # Filter inactive, expired, or claimed by OTHER bots
                 if o['is_active'] and o['expires_turn'] > turn:
+                    if o['order_id'] in claimed_orders:
+                        continue
+                        
                     score = len(o['required'])
                     # Prioritize expensive/complex orders if time permits
                     if score < best_score:
@@ -252,103 +304,111 @@ class BotPlayer:
                         best = o
             
             if best:
+                state.current_order = best
+                claimed_orders.add(best['order_id']) # Claim it immediately for subsequent bots in this turn
+                
                 req = list(best['required'])
                 # Non-cooking first
-                self.ingredients_needed = [i for i in req if not self._needs_cooking(i)] + \
+                state.ingredients_needed = [i for i in req if not self._needs_cooking(i)] + \
                                           [i for i in req if self._needs_cooking(i)]
-                self.state = 1
+                state.state = 1
         
         # State 1: Ensure pan
-        elif self.state == 1:
-            if any(self._needs_cooking(i) for i in self.ingredients_needed):
+        elif state.state == 1:
+            if any(self._needs_cooking(i) for i in state.ingredients_needed):
                 if self._get_free_cooker(controller):
-                    self.state = 2
+                    state.state = 2
                 else:
                     cooker = self._get_cooker_needing_pan(controller)
                     if cooker:
                         kx, ky = cooker
                         if holding:
                             if holding.get('type') == 'Pan':
-                                if self._move_to(controller, bot_id, kx, ky):
+                                if self._move_to(controller, bot_id, kx, ky, blocked_tiles):
                                     controller.place(bot_id, kx, ky)
-                                    self.state = 2
+                                    state.state = 2
                             else:
-                                self.state = 99
+                                state.state = 99
                         else:
-                            if self._move_to(controller, bot_id, sx, sy):
+                            if self._move_to(controller, bot_id, sx, sy, blocked_tiles):
                                 if controller.get_team_money(controller.get_team()) >= ShopCosts.PAN.buy_cost:
                                     controller.buy(bot_id, ShopCosts.PAN, sx, sy)
                     else:
-                        self.state = 2
+                        # No cooker available/needing pan? Assume setup is ok or wait
+                        state.state = 2
             else:
-                self.state = 2
+                state.state = 2
         
         # State 2: Buy/place plate
-        elif self.state == 2:
+        elif state.state == 2:
             if holding:
                 if holding.get('type') == 'Plate':
-                    if not self.plate_counter:
-                        bx, by = info['x'], info['y']
-                        self.plate_counter = self._get_free_counter(controller, bot_pos=(bx, by))
+                    if not state.plate_counter:
+                        state.plate_counter = self._get_free_counter(controller, exclude=reserved_counters, bot_pos=(bx, by), blocked_tiles=blocked_tiles)
                     
-                    if self.plate_counter:
-                        px, py = self.plate_counter
-                        adjacent = self._move_to(controller, bot_id, px, py)
+                    if state.plate_counter:
+                        # Reserve it
+                        reserved_counters.add(state.plate_counter)
+                        
+                        px, py = state.plate_counter
+                        adjacent = self._move_to(controller, bot_id, px, py, blocked_tiles)
                         if adjacent:
                             if controller.place(bot_id, px, py):
-                                self.state = 10
+                                state.state = 10
                     else:
-                        print(f"Error: No plate counter available")
+                        print(f"Error: No plate counter available for Bot {bot_id}")
                 else:
-                    self.state = 99
+                    state.state = 99
             else:
-                adjacent = self._move_to(controller, bot_id, sx, sy)
+                adjacent = self._move_to(controller, bot_id, sx, sy, blocked_tiles)
                 money = controller.get_team_money(controller.get_team())
                 if adjacent:
-                    # Check if we already have a plate somewhere? Nah, simple is fine
                     if money >= ShopCosts.PLATE.buy_cost:
                         controller.buy(bot_id, ShopCosts.PLATE, sx, sy)
         
         # State 10: Next ingredient
-        elif self.state == 10:
-            if not self.ingredients_needed:
-                self.state = 20
+        elif state.state == 10:
+            if not state.ingredients_needed:
+                state.state = 20
             else:
-                self.sub_state = 0
-                self.work_counter = None
-                self.state = 11
+                state.sub_state = 0
+                state.work_counter = None
+                state.state = 11
         
         # State 11: Buy ingredient
-        elif self.state == 11:
-            if not self.ingredients_needed:
-                self.state = 20
+        elif state.state == 11:
+            if not state.ingredients_needed:
+                state.state = 20
                 return
             
-            ing = self.ingredients_needed[0]
+            ing = state.ingredients_needed[0]
             ft = self._food_type(ing)
             
             if holding:
                 if holding.get('type') == 'Food':
                     # verify it's the right food
                     if holding.get('food_name') == ing:
-                         self.state = 12
+                         state.state = 12
                     else:
-                         # Wrong food? trash it
-                         self.state = 99
+                         state.state = 99
                 else:
-                    self.state = 99
+                    state.state = 99
             else:
                 # CHECK IF WE ALREADY HAVE IT ON MAP
                 loc, is_cooking = self._find_existing_ingredient(controller, ing)
+                # TODO: Check if this ingredient is claimed/being used by another bot?
+                # For now, simplistic check to assume if we didn't put it there, we shouldn't steal it unless desperate
+                
                 if loc:
                      if is_cooking:
                          # Cooking in execution
                          if self._needs_chopping(ing):
-                             self.sub_state = 4 # Wait code for chop_cook
+                             state.sub_state = 4 
                          else:
-                             self.sub_state = 1 # Wait code for cook_only
+                             state.sub_state = 1 
                      else:
-                         self.work_counter = loc
+                         state.work_counter = loc
+                         reserved_counters.add(loc)
                          
                          # Check status
                          tile = controller.get_tile(controller.get_team(), *loc)
@@ -357,308 +417,312 @@ class BotPlayer:
                              
                              if self._needs_chopping(ing):
                                  if is_chopped:
-                                     self.sub_state = 2 # Pickup chopped
+                                     state.sub_state = 2 # Pickup chopped
                                  else:
-                                     self.sub_state = 1 # Chop
+                                     state.sub_state = 1 # Chop
                              else:
-                                 # Need to pick up raw egg/noodles
-                                 # _cook_only needs to handle this
-                                 self.sub_state = 0 
+                                 state.sub_state = 0 
                                  
-                     self.state = 12
+                     state.state = 12
                      return
 
                 # Buy only if not found
-                if self._move_to(controller, bot_id, sx, sy):
+                if self._move_to(controller, bot_id, sx, sy, blocked_tiles):
                     cost = ft.buy_cost
                     if controller.get_team_money(controller.get_team()) >= cost:
                         controller.buy(bot_id, ft, sx, sy)
-                        self.state = 12
+                        state.state = 12
         
         # State 12: Process
-        elif self.state == 12:
-            if not self.ingredients_needed:
-                self.state = 20
+        elif state.state == 12:
+            if not state.ingredients_needed:
+                state.state = 20
                 return
             
-            ing = self.ingredients_needed[0]
+            ing = state.ingredients_needed[0]
             chop = self._needs_chopping(ing)
             cook = self._needs_cooking(ing)
             
             if chop and cook:
-                self._chop_cook(controller, bot_id, holding)
+                self._chop_cook(controller, bot_id, state, holding, reserved_counters, blocked_tiles)
             elif cook:
-                self._cook_only(controller, bot_id, holding)
+                self._cook_only(controller, bot_id, state, holding, reserved_counters, blocked_tiles)
             elif chop:
-                self._chop_only(controller, bot_id, holding)
+                self._chop_only(controller, bot_id, state, holding, reserved_counters, blocked_tiles)
             else:
-                self.state = 13
+                state.state = 13
         
         # State 13: Add to plate
-        elif self.state == 13:
-            if self.plate_counter:
-                px, py = self.plate_counter
-                if self._move_to(controller, bot_id, px, py):
+        elif state.state == 13:
+            if state.plate_counter:
+                px, py = state.plate_counter
+                if self._move_to(controller, bot_id, px, py, blocked_tiles):
                     if controller.add_food_to_plate(bot_id, px, py):
-                        if self.ingredients_needed:
-                            self.ingredients_needed.pop(0)
-                        self.state = 10
+                        if state.ingredients_needed:
+                            state.ingredients_needed.pop(0)
+                        state.state = 10
         
         # State 20: Pickup plate
-        elif self.state == 20:
+        elif state.state == 20:
             if holding:
                 if holding.get('type') == 'Plate':
-                    self.state = 21
+                    state.state = 21
                 else:
-                    self.state = 99
-            elif self.plate_counter:
-                px, py = self.plate_counter
-                if self._move_to(controller, bot_id, px, py):
+                    state.state = 99
+            elif state.plate_counter:
+                px, py = state.plate_counter
+                if self._move_to(controller, bot_id, px, py, blocked_tiles):
                     if controller.pickup(bot_id, px, py):
-                        self.state = 21
+                        state.state = 21
         
         # State 21: Submit
-        elif self.state == 21:
-            if self._move_to(controller, bot_id, ux, uy):
+        elif state.state == 21:
+            if self._move_to(controller, bot_id, ux, uy, blocked_tiles):
                 controller.submit(bot_id, ux, uy)
-                self.state = 0
+                state.state = 0
         
         # State 99: Trash
-        elif self.state == 99:
+        elif state.state == 99:
             if holding and self.trash_loc:
                 tx, ty = self.trash_loc
-                if self._move_to(controller, bot_id, tx, ty):
+                if self._move_to(controller, bot_id, tx, ty, blocked_tiles):
                     controller.trash(bot_id, tx, ty)
-                    self.state = 0
-                    self.sub_state = 0
-                    self.ingredients_needed = []
-                    self.plate_counter = None
-                    self.work_counter = None
-                    # Ensure we don't start immediately with bad cache
-                    self.counters = None 
+                    state.state = 0
+                    state.sub_state = 0
+                    state.ingredients_needed = []
+                    state.plate_counter = None
+                    state.work_counter = None
+                    state.current_order = None
             else:
-                self.state = 0
-                self.sub_state = 0
-                self.ingredients_needed = []
-                self.plate_counter = None
-                self.work_counter = None
+                state.state = 0
+                state.sub_state = 0
+                state.ingredients_needed = []
+                state.plate_counter = None
+                state.work_counter = None
+                state.current_order = None
 
-    def _chop_only(self, controller, bot_id, holding):
-        if not self.work_counter:
-            exclude = {self.plate_counter} if self.plate_counter else set()
+    def _chop_only(self, controller, bot_id, state, holding, reserved, blocked):
+        if not state.work_counter:
+             # Exclude global reserved + own plate counter
+            exclude = set(reserved)
+            if state.plate_counter: exclude.add(state.plate_counter)
+            
             bot_state = controller.get_bot_state(bot_id)
-            self.work_counter = self._get_free_counter(controller, exclude, bot_pos=(bot_state['x'], bot_state['y']))
+            state.work_counter = self._get_free_counter(controller, exclude, bot_pos=(bot_state['x'], bot_state['y']), blocked_tiles=blocked)
         
-        if not self.work_counter:
-            self.state = 99
+        if not state.work_counter:
+            state.state = 99
             return
         
-        wx, wy = self.work_counter
+        reserved.add(state.work_counter) # Lock it again
+        wx, wy = state.work_counter
         
-        if self.sub_state == 0:  # Place
+        if state.sub_state == 0:  # Place
             if holding:
                 if holding.get('type') == 'Food':
                     if holding.get('chopped'):
-                        self.state = 13
+                        state.state = 13
                         return
-                    if self._move_to(controller, bot_id, wx, wy):
+                    if self._move_to(controller, bot_id, wx, wy, blocked):
                         if controller.place(bot_id, wx, wy):
-                            self.sub_state = 1
+                            state.sub_state = 1
                 else:
-                    self.state = 99
+                    state.state = 99
             else:
-                self.state = 11
+                state.state = 11
                 
-        elif self.sub_state == 1:  # Chop
-            if self._move_to(controller, bot_id, wx, wy):
+        elif state.sub_state == 1:  # Chop
+            if self._move_to(controller, bot_id, wx, wy, blocked):
                 tile = controller.get_tile(controller.get_team(), wx, wy)
                 if tile and isinstance(tile.item, Food):
                     if tile.item.chopped:
-                        self.sub_state = 2
+                        state.sub_state = 2
                     else:
                         controller.chop(bot_id, wx, wy)
                 else:
-                    self.state = 11
-                    self.sub_state = 0
+                    state.state = 11
+                    state.sub_state = 0
                     
-        elif self.sub_state == 2:  # Pickup
+        elif state.sub_state == 2:  # Pickup
             if holding:
-                self.state = 13
-                self.sub_state = 0
+                state.state = 13
+                state.sub_state = 0
             else:
-                if self._move_to(controller, bot_id, wx, wy):
+                if self._move_to(controller, bot_id, wx, wy, blocked):
                     if controller.pickup(bot_id, wx, wy):
-                        self.state = 13
-                        self.sub_state = 0
+                        state.state = 13
+                        state.sub_state = 0
 
-    def _cook_only(self, controller, bot_id, holding):
-        if self.sub_state == 0:  # Place on cooker
+    def _cook_only(self, controller, bot_id, state, holding, reserved, blocked):
+        if state.sub_state == 0:  # Place on cooker
             if holding:
                 if holding.get('type') == 'Food':
                     stage = holding.get('cooked_stage', 0)
                     if stage == 1:
-                        self.state = 13
+                        state.state = 13
                         return
                     elif stage == 2:
-                        self.state = 99
+                        state.state = 99
                         return
                     
                     cooker = self._get_free_cooker(controller)
                     if cooker:
                         kx, ky = cooker
-                        if self._move_to(controller, bot_id, kx, ky):
+                        if self._move_to(controller, bot_id, kx, ky, blocked):
                             if controller.place(bot_id, kx, ky):
-                                self.sub_state = 1
+                                state.sub_state = 1
                     elif self.cookers:
-                        self._move_to(controller, bot_id, *self.cookers[0])
+                        self._move_to(controller, bot_id, *self.cookers[0], blocked_tiles=blocked)
                 else:
-                    self.state = 99
+                    state.state = 99
             else:
                 # RECOVERY: Pick up from work_counter if verified
-                if self.work_counter:
-                     wx, wy = self.work_counter
+                if state.work_counter:
+                     wx, wy = state.work_counter
                      tile = controller.get_tile(controller.get_team(), wx, wy)
                      if tile and isinstance(tile.item, Food):
-                         if self._move_to(controller, bot_id, wx, wy):
+                         if self._move_to(controller, bot_id, wx, wy, blocked):
                              controller.pickup(bot_id, wx, wy)
                          return
 
                 for kx, ky in self.cookers:
                     tile = controller.get_tile(controller.get_team(), kx, ky)
                     if tile and isinstance(tile.item, Pan) and tile.item.food:
-                        self.sub_state = 1
+                        state.sub_state = 1
                         return
-                self.state = 11
-                self.sub_state = 0
+                state.state = 11
+                state.sub_state = 0
                 
-        elif self.sub_state == 1:  # Wait
+        elif state.sub_state == 1:  # Wait
             for kx, ky in self.cookers:
                 tile = controller.get_tile(controller.get_team(), kx, ky)
                 if tile and isinstance(tile.item, Pan) and tile.item.food:
                     stage = tile.item.food.cooked_stage
                     if stage == 1:
-                        if self._move_to(controller, bot_id, kx, ky):
+                        if self._move_to(controller, bot_id, kx, ky, blocked):
                             if controller.take_from_pan(bot_id, kx, ky):
-                                self.state = 13
-                                self.sub_state = 0
+                                state.state = 13
+                                state.sub_state = 0
                         return
                     elif stage == 2:
-                        if self._move_to(controller, bot_id, kx, ky):
+                        if self._move_to(controller, bot_id, kx, ky, blocked):
                             controller.take_from_pan(bot_id, kx, ky)
-                        self.state = 99
-                        self.sub_state = 0
+                        state.state = 99
+                        state.sub_state = 0
                         return
                     else:
-                        self._move_to(controller, bot_id, kx, ky)
+                        self._move_to(controller, bot_id, kx, ky, blocked)
                         return
-            self.state = 11
-            self.sub_state = 0
+            state.state = 11
+            state.sub_state = 0
 
-    def _chop_cook(self, controller, bot_id, holding):
-        if not self.work_counter:
-            exclude = {self.plate_counter} if self.plate_counter else set()
+    def _chop_cook(self, controller, bot_id, state, holding, reserved, blocked):
+        if not state.work_counter:
+            exclude = set(reserved)
+            if state.plate_counter: exclude.add(state.plate_counter)
             bot_state = controller.get_bot_state(bot_id)
-            self.work_counter = self._get_free_counter(controller, exclude, bot_pos=(bot_state['x'], bot_state['y']))
+            state.work_counter = self._get_free_counter(controller, exclude, bot_pos=(bot_state['x'], bot_state['y']), blocked_tiles=blocked)
         
-        if not self.work_counter:
-            self.state = 99
+        if not state.work_counter:
+            state.state = 99
             return
         
-        wx, wy = self.work_counter
+        reserved.add(state.work_counter)
+        wx, wy = state.work_counter
         
-        if self.sub_state == 0:  # Place to chop
+        if state.sub_state == 0:  # Place to chop
             if holding:
                 if holding.get('type') == 'Food':
                     if holding.get('chopped'):
-                        self.sub_state = 3
+                        state.sub_state = 3
                         return
-                    if self._move_to(controller, bot_id, wx, wy):
+                    if self._move_to(controller, bot_id, wx, wy, blocked):
                         if controller.place(bot_id, wx, wy):
-                            self.sub_state = 1
+                            state.sub_state = 1
                 else:
-                    self.state = 99
+                    state.state = 99
             else:
                 tile = controller.get_tile(controller.get_team(), wx, wy)
                 if tile and isinstance(tile.item, Food):
-                    self.sub_state = 1
+                    state.sub_state = 1
                 else:
                     for kx, ky in self.cookers:
                         t = controller.get_tile(controller.get_team(), kx, ky)
                         if t and isinstance(t.item, Pan) and t.item.food:
-                            self.sub_state = 4
+                            state.sub_state = 4
                             return
-                    self.state = 11
-                    self.sub_state = 0
+                    state.state = 11
+                    state.sub_state = 0
                     
-        elif self.sub_state == 1:  # Chop
-            if self._move_to(controller, bot_id, wx, wy):
+        elif state.sub_state == 1:  # Chop
+            if self._move_to(controller, bot_id, wx, wy, blocked):
                 tile = controller.get_tile(controller.get_team(), wx, wy)
                 if tile and isinstance(tile.item, Food):
                     if tile.item.chopped:
-                        self.sub_state = 2
+                        state.sub_state = 2
                     else:
                         controller.chop(bot_id, wx, wy)
                 else:
-                    self.state = 11
-                    self.sub_state = 0
+                    state.state = 11
+                    state.sub_state = 0
                     
-        elif self.sub_state == 2:  # Pickup chopped
+        elif state.sub_state == 2:  # Pickup chopped
             if holding:
-                self.sub_state = 3
+                state.sub_state = 3
             else:
-                if self._move_to(controller, bot_id, wx, wy):
+                if self._move_to(controller, bot_id, wx, wy, blocked):
                     controller.pickup(bot_id, wx, wy)
                     
-        elif self.sub_state == 3:  # Place on cooker
+        elif state.sub_state == 3:  # Place on cooker
             if holding:
                 if holding.get('type') == 'Food':
                     stage = holding.get('cooked_stage', 0)
                     if stage == 1:
-                        self.state = 13
-                        self.sub_state = 0
+                        state.state = 13
+                        state.sub_state = 0
                         return
                     elif stage == 2:
-                        self.state = 99
-                        self.sub_state = 0
+                        state.state = 99
+                        state.sub_state = 0
                         return
                     
                     cooker = self._get_free_cooker(controller)
                     if cooker:
                         kx, ky = cooker
-                        if self._move_to(controller, bot_id, kx, ky):
+                        if self._move_to(controller, bot_id, kx, ky, blocked):
                             if controller.place(bot_id, kx, ky):
-                                self.sub_state = 4
+                                state.sub_state = 4
                     elif self.cookers:
-                        self._move_to(controller, bot_id, *self.cookers[0])
+                        self._move_to(controller, bot_id, *self.cookers[0], blocked_tiles=blocked)
                 else:
-                    self.state = 99
+                    state.state = 99
             else:
                 for kx, ky in self.cookers:
                     tile = controller.get_tile(controller.get_team(), kx, ky)
                     if tile and isinstance(tile.item, Pan) and tile.item.food:
-                        self.sub_state = 4
+                        state.sub_state = 4
                         return
-                self.sub_state = 2
+                state.sub_state = 2
                 
-        elif self.sub_state == 4:  # Wait for cook
+        elif state.sub_state == 4:  # Wait for cook
             for kx, ky in self.cookers:
                 tile = controller.get_tile(controller.get_team(), kx, ky)
                 if tile and isinstance(tile.item, Pan) and tile.item.food:
                     stage = tile.item.food.cooked_stage
                     if stage == 1:
-                        if self._move_to(controller, bot_id, kx, ky):
+                        if self._move_to(controller, bot_id, kx, ky, blocked):
                             if controller.take_from_pan(bot_id, kx, ky):
-                                self.state = 13
-                                self.sub_state = 0
+                                state.state = 13
+                                state.sub_state = 0
                         return
                     elif stage == 2:
-                        if self._move_to(controller, bot_id, kx, ky):
+                        if self._move_to(controller, bot_id, kx, ky, blocked):
                             controller.take_from_pan(bot_id, kx, ky)
-                        self.state = 99
-                        self.sub_state = 0
+                        state.state = 99
+                        state.sub_state = 0
                         return
                     else:
-                        self._move_to(controller, bot_id, kx, ky)
+                        self._move_to(controller, bot_id, kx, ky, blocked)
                         return
-            self.state = 11
-            self.sub_state = 0
+            state.state = 11
+            state.sub_state = 0
