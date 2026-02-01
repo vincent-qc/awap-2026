@@ -54,6 +54,7 @@ class BotPlayer:
         self.handoff_happened_turn = False
         self.last_handoff_items = []
         self.debug_board = True
+        self.helper_map_active = False
 
         # Bot States: map bot_id -> BotState
         self.bot_states = {}
@@ -1008,16 +1009,8 @@ class BotPlayer:
         if my_dist and not self._has_access(my_dist, self.submit_loc):
             return -float('inf')
 
-        # 1. Cost & Profit
-        ingredient_cost = 0
-        for ing in order['required']:
-            ft = self.get_food_type(ing)
-            if ft:
-                ingredient_cost += ft.buy_cost
-
-        profit = order['reward'] - ingredient_cost
-
-        # 2. Time
+        # 1. Time + ingredient count focus
+        ingredient_count = len(order['required'])
         time_left = order['expires_turn'] - turn
 
         # Short-circuit if we cannot finish before expiry.
@@ -1026,28 +1019,11 @@ class BotPlayer:
         if sim_time > time_left:
             return -float('inf')
 
-        # Estimate time: 15 turns per ingredient + 10 buffer
-        # This is a rough heuristic.
-        estimated_time = len(order['required']) * 15 + 10
-
-        # Lenient timing: only hard-fail if we're far behind schedule.
-        time_penalty = 0
-        if time_left < estimated_time:
-            if time_left < estimated_time * 0.6:
-                return -float('inf')
-            time_penalty = (estimated_time - time_left) * 40
-
-        # 3. Score
-        # Profit base
-        score = profit
-
-        # Risk adjustment: prioritize avoiding high penalty
-        score += order['penalty'] * 0.5
-
-        # Urgency bonus: increases as deadline approaches
-        # Cap time_left at 1 to avoid division by zero
-        score += (500 / max(1, time_left))
-        score -= time_penalty
+        # 2. Score
+        # Primary key: fewer ingredients is always better.
+        # Secondary key: more time per ingredient is better.
+        time_per_ingredient = time_left / max(1, ingredient_count)
+        score = (-ingredient_count * 100000) + time_per_ingredient
 
         return score
 
@@ -1090,6 +1066,10 @@ class BotPlayer:
             info = controller.get_bot_state(bid)
             start = (info['x'], info['y'])
             self.bot_dist_maps[bid] = self._build_dist_map([start])
+        # Helper map if any bot cannot reach submit.
+        self.helper_map_active = any(
+            dm and not self._has_access(dm, self.submit_loc)
+            for dm in self.bot_dist_maps.values())
 
         # Gather shared knowledge
         reserved_counters = set()
@@ -1174,7 +1154,8 @@ class BotPlayer:
         bx, by = info['x'], info['y']
 
         my_dist = self.bot_dist_maps.get(bot_id)
-        if not self._is_helper_mode(my_dist):
+        is_helper = self._is_helper_mode(my_dist)
+        if not self.helper_map_active:
             self.run_normal_logic(
                 controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles)
             return
@@ -1262,7 +1243,7 @@ class BotPlayer:
                             state.task_stage = 12
                         self.process_chop_cook(
                             controller, bot_id, state, holding, reserved_counters, blocked_tiles, held_name,
-                            my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=True)
+                            my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper)
                         return
                     if self.needs_cooking(held_name):
                         if state.task_stage != 12 or not state.ingredients_needed or state.ingredients_needed[0] != held_name:
@@ -1271,7 +1252,7 @@ class BotPlayer:
                             state.task_stage = 12
                         self.process_cook_only(
                             controller, bot_id, state, holding, reserved_counters, blocked_tiles, held_name,
-                            my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=True)
+                            my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper)
                         return
                     if self.needs_chopping(held_name):
                         if state.task_stage != 12 or not state.ingredients_needed or state.ingredients_needed[0] != held_name:
@@ -1280,7 +1261,7 @@ class BotPlayer:
                             state.task_stage = 12
                         self.process_chop_only(
                             controller, bot_id, state, holding, reserved_counters, blocked_tiles,
-                            my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=True)
+                            my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper)
                         return
                     if self._attempt_handoff(controller, bot_id, state, my_dist, other_dist_maps, blocked_tiles):
                         return
@@ -1647,15 +1628,15 @@ class BotPlayer:
             if chop and cook:
                 self.process_chop_cook(
                     controller, bot_id, state, holding, reserved_counters, blocked_tiles, ing,
-                    my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=True)
+                    my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper)
             elif cook:
                 self.process_cook_only(
                     controller, bot_id, state, holding, reserved_counters, blocked_tiles, ing,
-                    my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=True)
+                    my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper)
             elif chop:
                 self.process_chop_only(
                     controller, bot_id, state, holding, reserved_counters, blocked_tiles,
-                    my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=True)
+                    my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper)
             else:
                 state.task_stage = 13
 
