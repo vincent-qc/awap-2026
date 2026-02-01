@@ -252,7 +252,172 @@ class BotPlayer:
             
             self._run_bot(controller, bot_id, my_state, others_reserved_counters, claimed_orders, other_bots_locs)
 
+    def _get_bot_inventory(self, controller, bot_id, state):
+        """Get list of ingredients currently possessed by this bot."""
+        inventory = []
+        
+        # 1. Held item
+        info = controller.get_bot_state(bot_id)
+        holding = info.get('holding')
+        if holding:
+             if holding.get('type') == 'Food':
+                 inventory.append(holding.get('food_name'))
+             elif holding.get('type') == 'Plate':
+                 # If plate has food, count it
+                 for item in holding.get('food', []):
+                     inventory.append(item['food_name'])
+        
+        # 2. Plate counter
+        if state.plate_counter:
+            tile = controller.get_tile(controller.get_team(), *state.plate_counter)
+            if tile and tile.item:
+                if isinstance(tile.item, Food):
+                    inventory.append(tile.item.food_name)
+                elif isinstance(tile.item, Plate):
+                    for item in tile.item.food:
+                         inventory.append(item['food_name'])
+
+        # 3. Work counter
+        if state.work_counter:
+            tile = controller.get_tile(controller.get_team(), *state.work_counter)
+            if tile and tile.item and isinstance(tile.item, Food):
+                inventory.append(tile.item.food_name)
+                
+        return inventory
+
+    def _handle_expired_order(self, controller, bot_id, state, claimed_orders):
+        """Check if current order is invalid/expired and try to rescue progress."""
+        current = state.current_order
+        if not current:
+            return False
+            
+        turn = controller.get_turn()
+        orders = controller.get_orders(controller.get_team())
+        
+        # Find current order object in active orders
+        matching_active = next((o for o in orders if o['order_id'] == current['order_id']), None)
+        
+        is_expired = False
+        if not matching_active:
+            is_expired = True
+        elif not matching_active['is_active']:
+            is_expired = True
+        elif matching_active['expires_turn'] <= turn:
+            is_expired = True
+
+        if is_expired:
+            print(f"[Bot {bot_id}] Order {current['order_id']} expired/gone!")
+            
+            # Check inventory for "significant progress"
+            inventory = self._get_bot_inventory(controller, bot_id, state)
+            
+            if not inventory:
+                # No progress, just reset normally
+                state.state = 0
+                state.current_order = None
+                return True
+                
+            print(f"[Bot {bot_id}] Has inventory {inventory}, trying to reuse...")
+            
+            # Score active orders based on inventory match
+            best_match = None
+            best_match_score = -1
+            
+            for o in orders:
+                if not o['is_active'] or o['expires_turn'] <= turn:
+                    continue
+                if o['order_id'] in claimed_orders:
+                    continue
+                
+                # Count how many inventory items are useful for this order
+                needed = list(o['required'])[:]
+                score = 0
+                for inv_item in inventory:
+                    if inv_item in needed:
+                        score += 5 # high value for reuse
+                        needed.remove(inv_item)
+                
+                # Tie-breaker: prioritization logic (time, value) from normal selection
+                score += len(o['required']) # Prefer more complex recipes if equal reuse
+                
+                if score > best_match_score:
+                    best_match_score = score
+                    best_match = o
+            
+            if best_match and best_match_score > 0:
+                print(f"[Bot {bot_id}] Switched to Order {best_match['order_id']} to reuse ingredients")
+                
+                # Unclaim old order just in case (though it's expired)
+                if current['order_id'] in claimed_orders:
+                    claimed_orders.remove(current['order_id'])
+                
+                state.current_order = best_match
+                claimed_orders.add(best_match['order_id'])
+                
+                # Re-calculate ingredients needed
+                req = list(best_match['required'])
+                remaining_needed = list(req)
+                
+                # Identify items that are ALREADY PLATED (safely done)
+                # We should ONLY remove items from 'needed' if they are already on the plate.
+                # Items that are held (as food) or on a work counter MUST stay in 'needed' 
+                # so the state machine processes/places them.
+                
+                plated_items = []
+                
+                # Check plate on counter
+                if state.plate_counter:
+                    tile = controller.get_tile(controller.get_team(), *state.plate_counter)
+                    if tile and tile.item and isinstance(tile.item, Plate):
+                        for item in tile.item.food:
+                            plated_items.append(item['food_name'])
+                            
+                # Check plate in hand
+                info = controller.get_bot_state(bot_id)
+                holding = info.get('holding')
+                if holding and holding.get('type') == 'Plate':
+                     for item in holding.get('food', []):
+                         plated_items.append(item['food_name'])
+
+                # Remove plated items from requirements
+                for done_item in plated_items:
+                    if done_item in remaining_needed:
+                        remaining_needed.remove(done_item)
+                
+                # Reset needs
+                # Prioritize: Non-cooking first (usually), but since we are recovering,
+                # we might be holding something cooked. The original logic separates them.
+                state.ingredients_needed = [i for i in remaining_needed if not self._needs_cooking(i)] + \
+                                          [i for i in remaining_needed if self._needs_cooking(i)]
+                
+                # If we are holding food, we need to ensure we don't reset to a state that trashes it.
+                # If we are holding the right food, State 11 (Buy) will see it and go to State 12 (Process).
+                # State 12 will see it's done and go to State 13 (Plate).
+                # So simply resetting to State 10 (Next Ingredient) is safe and correct.
+                state.state = 10 
+                return True
+            else:
+                print(f"[Bot {bot_id}] No matching order for reuse. Resetting.")
+                state.state = 99 # Trash it? Or just reset?
+                # If we have stuff, trashing is safer to clear hands
+                state.state = 99
+                return True
+        
+        return False
+
     def _run_bot(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles):
+        # BOT 2 SPECIAL LOGIC (Assuming Bot 2 is the second one in list, let's use ID check if we knew it)
+        # The user said "bot 2", assuming index 1 or specific ID. 
+        # Usually IDs are 0, 1? Or 1, 2? 
+        # "get_team_bot_ids" returns a list. 
+        team_bots = controller.get_team_bot_ids(controller.get_team())
+        is_bot_2 = (len(team_bots) >= 2 and bot_id == team_bots[1])
+        
+        if is_bot_2 and state.current_order:
+             if self._handle_expired_order(controller, bot_id, state, claimed_orders):
+                 # State updated, continue execution with new state
+                 pass
+
         info = controller.get_bot_state(bot_id)
         holding = info.get('holding')
         bx, by = info['x'], info['y']
