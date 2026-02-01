@@ -43,6 +43,8 @@ class BotPlayer:
         self.trash_loc = None
         self.shops = None
         self.ingredient_sources = None
+        self.ingredient_clusters = []
+        self.largest_ingredient_cluster = []
         self.landmarks = []
         self.boxes = None
         self.cooker_priority = []
@@ -52,6 +54,7 @@ class BotPlayer:
         self.dist_from_submit = None
         self.dist_from_counters = None
         self.dist_from_cookers = None
+        self.critical_tiles = set()
         self.shared_handoff_counters = []
         self.primary_handoff_counter = None
         self.bot_dist_maps = {}
@@ -75,6 +78,8 @@ class BotPlayer:
         self.cookers = []
         self.shops = []
         self.ingredient_sources = []
+        self.ingredient_clusters = []
+        self.largest_ingredient_cluster = []
         self.landmarks = []
         self.boxes = []
         self.cooker_priority = []
@@ -83,10 +88,13 @@ class BotPlayer:
         self.dist_from_submit = None
         self.dist_from_counters = None
         self.dist_from_cookers = None
+        self.critical_tiles = set()
         self.shared_handoff_counters = []
         self.primary_handoff_counter = None
         self.bot_dist_maps = {}
         self.expiry_safety_buffer = None
+        self.ingredient_clusters = []
+        self.largest_ingredient_cluster = []
 
         for x in range(m.width):
             for y in range(m.height):
@@ -151,6 +159,130 @@ class BotPlayer:
                     self.shared_handoff_counters.append(c)
         if self.shared_handoff_counters:
             self.primary_handoff_counter = self.shared_handoff_counters[0]
+        self.ingredient_clusters = self._compute_ingredient_clusters()
+        self.largest_ingredient_cluster = self.ingredient_clusters[0] if self.ingredient_clusters else [
+        ]
+        self.critical_tiles = self._compute_critical_tiles()
+
+    def _compute_ingredient_clusters(self):
+        sources = set(self.ingredient_sources or [])
+        clusters = []
+        visited = set()
+        for pos in sources:
+            if pos in visited:
+                continue
+            cluster = []
+            stack = [pos]
+            visited.add(pos)
+            while stack:
+                cx, cy = stack.pop()
+                cluster.append((cx, cy))
+                for dx in [-1, 0, 1]:
+                    for dy in [-1, 0, 1]:
+                        if dx == 0 and dy == 0:
+                            continue
+                        nx, ny = cx + dx, cy + dy
+                        if (nx, ny) in sources and (nx, ny) not in visited:
+                            visited.add((nx, ny))
+                            stack.append((nx, ny))
+            clusters.append(cluster)
+        clusters.sort(key=lambda c: (-len(c), min(c)))
+        return clusters
+
+    def _compute_critical_tiles(self):
+        if not self.cached_map:
+            return set()
+        m = self.cached_map
+        walkable = set()
+        for x in range(m.width):
+            for y in range(m.height):
+                if m.is_tile_walkable(x, y):
+                    walkable.add((x, y))
+        if not walkable:
+            return set()
+
+        def neighbors(pos):
+            x, y = pos
+            out = []
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx, ny = x + dx, y + dy
+                    if (nx, ny) in walkable:
+                        out.append((nx, ny))
+            return out
+
+        disc = {}
+        low = {}
+        parent = {}
+        time = 0
+        critical = set()
+
+        def dfs(u):
+            nonlocal time
+            time += 1
+            disc[u] = time
+            low[u] = time
+            child_count = 0
+            for v in neighbors(u):
+                if v not in disc:
+                    parent[v] = u
+                    child_count += 1
+                    dfs(v)
+                    low[u] = min(low[u], low[v])
+                    if parent.get(u) is None and child_count > 1:
+                        critical.add(u)
+                    if parent.get(u) is not None and low[v] >= disc[u]:
+                        critical.add(u)
+                elif v != parent.get(u):
+                    low[u] = min(low[u], disc[v])
+
+        for node in walkable:
+            if node not in disc:
+                parent[node] = None
+                dfs(node)
+
+        return critical
+
+    def _pick_cluster_target(self, cluster, bot_pos, dist_map):
+        if not cluster:
+            return None
+        best = None
+        best_dist = 9999
+        for pos in cluster:
+            if dist_map is not None:
+                d = self._distance_to_tile(dist_map, pos)
+            else:
+                d = self._chebyshev(bot_pos, pos)
+            if d < best_dist:
+                best_dist = d
+                best = pos
+        if dist_map is not None and best_dist >= 9999:
+            return None
+        return best
+
+    def _stuck_escape_move(self, controller, bot_id, bot_pos, dist_map, blocked_tiles):
+        target = self._pick_cluster_target(
+            self.largest_ingredient_cluster, bot_pos, dist_map)
+        candidates = []
+        if target:
+            candidates.append(target)
+        if self.shop_loc:
+            candidates.append(self.shop_loc)
+        if self.submit_loc:
+            candidates.append(self.submit_loc)
+        for tx, ty in candidates:
+            if dist_map is not None and not self._has_access(dist_map, (tx, ty)):
+                continue
+            step = self.get_next_step_astar(
+                controller, bot_pos, tx, ty, blocked=blocked_tiles)
+            if step is None:
+                continue
+            if step != (0, 0):
+                controller.move(bot_id, step[0], step[1])
+            return True
+        return False
 
     def get_next_step_astar(self, controller, start, target_x, target_y, blocked=None):
         # Get next step towards target using A* with Manhattan heuristic. Returns (dx, dy) or None.
@@ -240,7 +372,7 @@ class BotPlayer:
 
     def get_free_counter(self, controller, exclude=None, bot_pos=None, blocked_tiles=None,
                          anchor_pos=None, zone_anchor=None, next_target=None, bot_dist_map=None):
-        # Find empty counter that is reachable and closest to the bot.
+        # Find empty counter that is reachable and closest to the shop, then bot.
         if exclude is None:
             exclude = set()
 
@@ -249,6 +381,13 @@ class BotPlayer:
                 return self._distance_to_tile(bot_dist_map, counter_pos)
             if bot_pos is not None:
                 return self._chebyshev(counter_pos, bot_pos)
+            return 0
+
+        def dist_shop(counter_pos):
+            if self.dist_from_shop is not None:
+                return self._distance_to_tile(self.dist_from_shop, counter_pos)
+            if self.shop_loc:
+                return self._chebyshev(counter_pos, self.shop_loc)
             return 0
 
         counters = self.counters or []
@@ -269,10 +408,8 @@ class BotPlayer:
                         controller, bot_pos, cx, cy, blocked=blocked_tiles)
                     reachable = step is not None
             if reachable:
-                candidates.append((dist_bot((cx, cy)),
-                                   self._chebyshev(
-                                       (cx, cy), anchor_pos) if anchor_pos else 0,
-                                   (cx, cy)))
+                candidates.append(
+                    (dist_shop((cx, cy)), dist_bot((cx, cy)), (cx, cy)))
 
         if candidates:
             candidates.sort()
@@ -293,10 +430,7 @@ class BotPlayer:
                     reachable = step is not None
             if reachable:
                 fallback.append(
-                    (dist_bot((cx, cy)),
-                     self._chebyshev(
-                         (cx, cy), anchor_pos) if anchor_pos else 0,
-                     (cx, cy)))
+                    (dist_shop((cx, cy)), dist_bot((cx, cy)), (cx, cy)))
         if fallback:
             fallback.sort()
             return fallback[0][2]
@@ -641,7 +775,7 @@ class BotPlayer:
 
     def choose_cooker(self, controller, anchor_pos=None, bot_pos=None, blocked_tiles=None,
                       want_food=False, reserved_cookers=None, allow_reserved=None):
-        # Pick a cooker in the closest cluster; tie-break by anchor/bot.
+        # Pick a cooker closest to the shop; tie-break by bot position.
         best = None
         best_dist = (float('inf'), float('inf'))
 
@@ -662,14 +796,15 @@ class BotPlayer:
                 if step is None:
                     continue
 
-            # Fully bias toward cluster closeness; use anchor/bot only to break ties.
-            dist_source = self.cooker_cluster_scores.get((kx, ky), 0)
-            tie_break = 0
-            if anchor_pos:
-                tie_break = self._chebyshev((kx, ky), anchor_pos)
-            elif bot_pos:
-                tie_break = self._chebyshev((kx, ky), bot_pos)
-            dist = (dist_source, tie_break)
+            if self.dist_from_shop is not None:
+                dist_shop = self._distance_to_tile(
+                    self.dist_from_shop, (kx, ky))
+            elif self.shop_loc:
+                dist_shop = self._chebyshev((kx, ky), self.shop_loc)
+            else:
+                dist_shop = 0
+            dist_bot = self._chebyshev((kx, ky), bot_pos) if bot_pos else 0
+            dist = (dist_shop, dist_bot)
 
             if dist < best_dist:
                 best_dist = dist
@@ -1148,9 +1283,6 @@ class BotPlayer:
                 debug_info.append(
                     f"B{bid}:({info['x']},{info['y']})[S{state_val}]")
         print(f"[{team} Turn {turn}] {' | '.join(debug_info)}")
-        if self.debug_board:
-            self.debug_print_bots(controller, bots)
-            self.debug_print_board(controller)
 
         # Reset per-turn handoff flag.
         self.handoff_happened_turn = False
@@ -1222,7 +1354,7 @@ class BotPlayer:
                 self.run_bot_1_behavior(
                     controller, bot_id, my_state, reserved_counters, reserved_cookers,
                     claimed_orders, other_bots_locs,
-                    order_heuristic=self.HEURISTIC_EXPIRY)
+                    order_heuristic=self.HEURISTIC_INGREDIENTS)
             elif is_bot_2:
                 self.run_bot_2_behavior(
                     controller, bot_id, my_state, reserved_counters, reserved_cookers,
@@ -1464,10 +1596,9 @@ class BotPlayer:
                         state.stuck_counter = 0
                         return
                 print(
-                    f"[Bot {bot_id}] STUCK in state {state.task_stage}, forcing random move")
-                import random
-                dx, dy = random.choice([(0, 1), (0, -1), (1, 0), (-1, 0)])
-                controller.move(bot_id, dx, dy)
+                    f"[Bot {bot_id}] STUCK in state {state.task_stage}, forcing escape move")
+                self._stuck_escape_move(
+                    controller, bot_id, (bx, by), my_dist, blocked_tiles)
                 state.stuck_counter = 0
                 return
         else:
@@ -1900,10 +2031,9 @@ class BotPlayer:
             state.stuck_counter += 1
             if state.stuck_counter > 10:
                 print(
-                    f"[Bot {bot_id}] STUCK in state {state.task_stage}, forcing random move")
-                import random
-                dx, dy = random.choice([(0, 1), (0, -1), (1, 0), (-1, 0)])
-                controller.move(bot_id, dx, dy)
+                    f"[Bot {bot_id}] STUCK in state {state.task_stage}, forcing escape move")
+                self._stuck_escape_move(
+                    controller, bot_id, (bx, by), my_dist, blocked_tiles)
                 state.stuck_counter = 0
                 return
         else:

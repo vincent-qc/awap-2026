@@ -1,35 +1,13 @@
-#U#R#$#
-b###.##
-.#....#
-.#...#S
-C#....#
-#.....#
-C#....#
-.#....#
-.#..b.#
-##B...#
-.#B..#T
-.#B...#
-.#B....
-.#B...#
-.#B..#K
+S..C..$
+K..C...
+K..CCbU
+Kb.CC.T
+K..C...
+R..C..$
 
-SWITCH: turn=10 duration=5
+SWITCH: turn=250 duration=100
 
 ORDERS:
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=10 penalty=5
-start=1  duration=50  required=NOODLES,MEAT           reward=100 penalty=5
+start=10     duration=500  required=EGG,ONIONS,MEAT,NOODLES,SAUCE           reward=10000 penalty=3
+start=20     duration=500  required=EGG,ONIONS,MEAT,NOODLES,SAUCE           reward=10000 penalty=3
+start=30     duration=500  required=EGG,ONIONS,MEAT,NOODLES,SAUCE           reward=10000 penalty=3
