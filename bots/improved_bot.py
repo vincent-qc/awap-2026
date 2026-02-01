@@ -18,6 +18,7 @@ class BotState:
         self.work_counter = None
         self.current_order = None
         self.cooker_target = None
+        self.zone_anchor = None
         self.pending_order_ids = []
         self.pending_items = []
         self.handoff_queue = []
@@ -58,6 +59,7 @@ class BotPlayer:
         self.last_handoff_items = []
         self.debug_board = True
         self.helper_map_active = False
+        self.expiry_safety_buffer = None
 
         # Bot States: map bot_id -> BotState
         self.bot_states = {}
@@ -84,6 +86,7 @@ class BotPlayer:
         self.shared_handoff_counters = []
         self.primary_handoff_counter = None
         self.bot_dist_maps = {}
+        self.expiry_safety_buffer = None
 
         for x in range(m.width):
             for y in range(m.height):
@@ -123,20 +126,17 @@ class BotPlayer:
             self._adjacent_walkables_multi(self.counters))
         self.dist_from_cookers = self._build_dist_map(
             self._adjacent_walkables_multi(self.cookers))
+        self.expiry_safety_buffer = self._compute_expiry_safety_buffer()
 
-        # Precompute cooker priority by shortest path closeness to shop + counters + submit.
+        # Precompute cooker priority by shortest path closeness to shop.
         self.cooker_cluster_scores = {}
         for cooker in self.cookers:
-            score = 0
             if self.dist_from_shop is not None:
-                score += 5 * \
-                    self._distance_to_tile(self.dist_from_shop, cooker)
-            if self.dist_from_counters is not None:
-                score += 2 * \
-                    self._distance_to_tile(self.dist_from_counters, cooker)
-            if self.dist_from_submit is not None:
-                score += 1 * \
-                    self._distance_to_tile(self.dist_from_submit, cooker)
+                score = self._distance_to_tile(self.dist_from_shop, cooker)
+            elif self.shop_loc:
+                score = self._chebyshev(cooker, self.shop_loc)
+            else:
+                score = 0
             self.cooker_cluster_scores[cooker] = score
         self.cooker_priority = sorted(
             self.cookers,
@@ -225,49 +225,81 @@ class BotPlayer:
             controller.move(bot_id, step[0], step[1])
         return False
 
-    def get_free_counter(self, controller, exclude=None, bot_pos=None, blocked_tiles=None, anchor_pos=None):
-        # Find empty counter that is reachable.
+    def _distance_to_target(self, from_pos, target_pos):
+        if not target_pos:
+            return 0
+        if target_pos == self.submit_loc and self.dist_from_submit is not None:
+            return self._distance_to_tile(self.dist_from_submit, from_pos)
+        if target_pos in (self.cookers or []) and self.dist_from_cookers is not None:
+            return self._distance_to_tile(self.dist_from_cookers, from_pos)
+        if target_pos in (self.counters or []) and self.dist_from_counters is not None:
+            return self._distance_to_tile(self.dist_from_counters, from_pos)
+        if target_pos in (self.shops or []) and self.dist_from_shop is not None:
+            return self._distance_to_tile(self.dist_from_shop, from_pos)
+        return self._chebyshev(from_pos, target_pos)
+
+    def get_free_counter(self, controller, exclude=None, bot_pos=None, blocked_tiles=None,
+                         anchor_pos=None, zone_anchor=None, next_target=None, bot_dist_map=None):
+        # Find empty counter that is reachable and closest to the bot.
         if exclude is None:
             exclude = set()
 
-        def dist(a, b):
-            return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+        def dist_bot(counter_pos):
+            if bot_dist_map is not None:
+                return self._distance_to_tile(bot_dist_map, counter_pos)
+            if bot_pos is not None:
+                return self._chebyshev(counter_pos, bot_pos)
+            return 0
 
-        # Prefer nearest to bot; use anchor as tie-breaker to keep a tight cluster.
-        counters = self.counters
-        if counters:
-            if bot_pos:
-                counters = sorted(
-                    counters,
-                    key=lambda c: (dist(c, bot_pos), dist(c, anchor_pos) if anchor_pos else 0))
-            elif anchor_pos:
-                counters = sorted(counters, key=lambda c: dist(c, anchor_pos))
+        counters = self.counters or []
+        candidates = []
 
-        # First try to find an empty reachable counter
         for cx, cy in counters:
             if (cx, cy) in exclude:
                 continue
             tile = controller.get_tile(controller.get_team(), cx, cy)
-            if tile and tile.item is None:
-                # Check if reachable (can find path)
-                if bot_pos:
+            if not tile or tile.item is not None:
+                continue
+            reachable = True
+            if bot_pos or bot_dist_map is not None:
+                if bot_dist_map is not None:
+                    reachable = dist_bot((cx, cy)) < 9999
+                else:
                     step = self.get_next_step_astar(
                         controller, bot_pos, cx, cy, blocked=blocked_tiles)
-                    if step is not None:
-                        return (cx, cy)
-                else:
-                    return (cx, cy)
+                    reachable = step is not None
+            if reachable:
+                candidates.append((dist_bot((cx, cy)),
+                                   self._chebyshev(
+                                       (cx, cy), anchor_pos) if anchor_pos else 0,
+                                   (cx, cy)))
+
+        if candidates:
+            candidates.sort()
+            return candidates[0][2]
 
         # Fallback: any counter not in exclude, preferring reachable ones
+        fallback = []
         for cx, cy in counters:
-            if (cx, cy) not in exclude:
-                if bot_pos:
+            if (cx, cy) in exclude:
+                continue
+            reachable = True
+            if bot_pos or bot_dist_map is not None:
+                if bot_dist_map is not None:
+                    reachable = dist_bot((cx, cy)) < 9999
+                else:
                     step = self.get_next_step_astar(
                         controller, bot_pos, cx, cy, blocked=blocked_tiles)
-                    if step is not None:
-                        return (cx, cy)
-                else:
-                    return (cx, cy)
+                    reachable = step is not None
+            if reachable:
+                fallback.append(
+                    (dist_bot((cx, cy)),
+                     self._chebyshev(
+                         (cx, cy), anchor_pos) if anchor_pos else 0,
+                     (cx, cy)))
+        if fallback:
+            fallback.sort()
+            return fallback[0][2]
 
         # Last resort: just return first counter
         return self.counters[0] if self.counters else None
@@ -405,6 +437,24 @@ class BotPlayer:
                 best = d
         return best
 
+    def _compute_expiry_safety_buffer(self):
+        # Conservative buffer based on map size and obstacle density.
+        m = self.cached_map
+        if not m:
+            return 3
+        area = m.width * m.height
+        if area <= 0:
+            return 3
+        walkable = 0
+        for x in range(m.width):
+            for y in range(m.height):
+                if m.is_tile_walkable(x, y):
+                    walkable += 1
+        complexity = 1.0 - (walkable / area)
+        size_buffer = max(2, int(area * 0.02))
+        complexity_buffer = int(area * complexity * 0.05)
+        return max(2, size_buffer + complexity_buffer)
+
     def choose_shop_for_bot(self, dist_map, bot_pos=None):
         if not self.shops:
             return self.shop_loc
@@ -417,6 +467,27 @@ class BotPlayer:
                 best_dist = d
                 best = (sx, sy)
         return best or self.shop_loc
+
+    def choose_work_zone(self, bot_pos, bot_dist_map=None):
+        # Assign a stable counter zone per bot to reduce cross-map shuffling.
+        if not self.counters:
+            return None
+        best = None
+        best_score = 9999
+        for c in self.counters:
+            if bot_dist_map is not None and self._distance_to_tile(bot_dist_map, c) >= 9999:
+                continue
+            score = self._chebyshev(bot_pos, c)
+            if self.dist_from_shop is not None:
+                score += self._distance_to_tile(self.dist_from_shop, c)
+            if self.dist_from_submit is not None:
+                score += self._distance_to_tile(self.dist_from_submit, c)
+            if self.dist_from_cookers is not None:
+                score += self._distance_to_tile(self.dist_from_cookers, c)
+            if score < best_score:
+                best_score = score
+                best = c
+        return best
 
     def _has_access(self, dist_map, target_pos):
         if not dist_map or not target_pos:
@@ -529,6 +600,7 @@ class BotPlayer:
                 state.ingredients_needed = []
                 state.work_counter = None
                 state.plate_counter = None
+                state.cooker_target = None
                 self.handoff_happened_turn = True
                 return True
             if self.debug_board:
@@ -567,7 +639,8 @@ class BotPlayer:
             return 0
         return sum(weight * self._chebyshev(pos, loc) for loc, weight in self.landmarks)
 
-    def choose_cooker(self, controller, anchor_pos=None, bot_pos=None, blocked_tiles=None, want_food=False):
+    def choose_cooker(self, controller, anchor_pos=None, bot_pos=None, blocked_tiles=None,
+                      want_food=False, reserved_cookers=None, allow_reserved=None):
         # Pick a cooker in the closest cluster; tie-break by anchor/bot.
         best = None
         best_dist = (float('inf'), float('inf'))
@@ -575,6 +648,8 @@ class BotPlayer:
         for kx, ky in self.cooker_priority:
             tile = controller.get_tile(controller.get_team(), kx, ky)
             if not tile or not isinstance(tile.item, Pan):
+                continue
+            if reserved_cookers and (kx, ky) in reserved_cookers and (allow_reserved is None or (kx, ky) != allow_reserved):
                 continue
             if want_food and tile.item.food is None:
                 continue
@@ -1011,9 +1086,26 @@ class BotPlayer:
         time_left = order['expires_turn'] - turn
         if time_left <= 0:
             return False
+        if not self._order_has_positive_margin(order):
+            return False
+        safety_buffer = self.expiry_safety_buffer if self.expiry_safety_buffer is not None else 3
+        if time_left <= safety_buffer:
+            return False
         sim_time = self.simulate_order_time(
             controller, bot_id, state, order, turn)
-        return sim_time <= time_left
+        return sim_time + safety_buffer <= time_left
+
+    def _order_has_positive_margin(self, order):
+        reward = order.get('reward', 0)
+        penalty = order.get('penalty', 0)
+        required = order.get('required', [])
+        total_cost = 0
+        for ing in required:
+            ft = self.get_food_type(ing)
+            if ft is not None:
+                total_cost += ft.buy_cost
+        # Skip only if doing the order is worse than letting it expire.
+        return (reward - total_cost) >= -penalty
 
     def calculate_order_heuristic(self, controller, bot_id, state, order, turn, team_money, heuristic=None):
         # Returns -float('inf') if impossible to complete in time.
@@ -1075,8 +1167,19 @@ class BotPlayer:
             dm and not self._has_access(dm, self.submit_loc)
             for dm in self.bot_dist_maps.values())
 
+        # Assign stable work zones per bot once per match.
+        for bid in bots:
+            st = self.bot_states.get(bid)
+            if not st:
+                continue
+            if st.zone_anchor is None:
+                info = controller.get_bot_state(bid)
+                st.zone_anchor = self.choose_work_zone(
+                    (info['x'], info['y']), self.bot_dist_maps.get(bid))
+
         # Gather shared knowledge
         reserved_counters = set()
+        reserved_cookers = set()
         claimed_orders = set()
         all_bot_positions = {}
 
@@ -1092,6 +1195,8 @@ class BotPlayer:
                     reserved_counters.add(st.plate_counter)
                 if st.work_counter:
                     reserved_counters.add(st.work_counter)
+                if st.cooker_target:
+                    reserved_cookers.add(st.cooker_target)
                 if st.current_order:
                     claimed_orders.add(st.current_order['order_id'])
 
@@ -1107,15 +1212,7 @@ class BotPlayer:
             other_bots_locs = {
                 pos for bid, pos in all_bot_positions.items() if bid != bot_id}
 
-            # Exclude this bot's own resources from exclusion list
             my_state = self.bot_states[bot_id]
-            my_reserved = set()
-            if my_state.plate_counter:
-                my_reserved.add(my_state.plate_counter)
-            if my_state.work_counter:
-                my_reserved.add(my_state.work_counter)
-
-            others_reserved_counters = reserved_counters - my_reserved
 
             # Identify which bot is which
             is_bot_1 = (bot_id == team_bots[0])
@@ -1123,48 +1220,57 @@ class BotPlayer:
 
             if is_bot_1:
                 self.run_bot_1_behavior(
-                    controller, bot_id, my_state, others_reserved_counters, claimed_orders, other_bots_locs,
+                    controller, bot_id, my_state, reserved_counters, reserved_cookers,
+                    claimed_orders, other_bots_locs,
                     order_heuristic=self.HEURISTIC_EXPIRY)
             elif is_bot_2:
                 self.run_bot_2_behavior(
-                    controller, bot_id, my_state, others_reserved_counters, claimed_orders, other_bots_locs,
+                    controller, bot_id, my_state, reserved_counters, reserved_cookers,
+                    claimed_orders, other_bots_locs,
                     order_heuristic=self.HEURISTIC_INGREDIENTS)
             else:
                 # Default behavior for extra bots
                 self.run_standard_logic(
-                    controller, bot_id, my_state, others_reserved_counters, claimed_orders, other_bots_locs,
+                    controller, bot_id, my_state, reserved_counters, reserved_cookers,
+                    claimed_orders, other_bots_locs,
                     order_heuristic=self.HEURISTIC_INGREDIENTS)
 
     # Bot 1 Behavior
 
-    def run_bot_1_behavior(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles, order_heuristic):
+    def run_bot_1_behavior(self, controller, bot_id, state, reserved_counters, reserved_cookers, claimed_orders, blocked_tiles, order_heuristic):
         # Bot 1 follows standard logic (expiry-first ordering).
         self.run_standard_logic(controller, bot_id, state,
-                                reserved_counters, claimed_orders, blocked_tiles, order_heuristic)
+                                reserved_counters, reserved_cookers, claimed_orders, blocked_tiles, order_heuristic)
 
     # Bot 2 Behavior
 
-    def run_bot_2_behavior(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles, order_heuristic):
+    def run_bot_2_behavior(self, controller, bot_id, state, reserved_counters, reserved_cookers, claimed_orders, blocked_tiles, order_heuristic):
         # Bot 2 has smart recovery logic for expired orders.
         if state.current_order:
             if self.handle_expired_order(controller, bot_id, state, claimed_orders):
                 pass  # State updated by recovery
 
         self.run_standard_logic(controller, bot_id, state,
-                                reserved_counters, claimed_orders, blocked_tiles, order_heuristic)
+                                reserved_counters, reserved_cookers, claimed_orders, blocked_tiles, order_heuristic)
 
     # Shared Logic
 
-    def run_standard_logic(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles, order_heuristic):
+    def run_standard_logic(self, controller, bot_id, state, reserved_counters, reserved_cookers, claimed_orders, blocked_tiles, order_heuristic):
         info = controller.get_bot_state(bot_id)
         holding = info.get('holding')
         bx, by = info['x'], info['y']
 
         my_dist = self.bot_dist_maps.get(bot_id)
+        my_reserved_counters = set()
+        if state.plate_counter:
+            my_reserved_counters.add(state.plate_counter)
+        if state.work_counter:
+            my_reserved_counters.add(state.work_counter)
+        exclude_counters = reserved_counters - my_reserved_counters
         is_helper = self._is_helper_mode(my_dist)
         if not self.helper_map_active:
             self.run_normal_logic(
-                controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles, order_heuristic)
+                controller, bot_id, state, reserved_counters, reserved_cookers, claimed_orders, blocked_tiles, order_heuristic)
             return
 
         other_dist_maps = [
@@ -1223,7 +1329,13 @@ class BotPlayer:
                             anchor_pos=state.work_counter or state.plate_counter,
                             bot_pos=(bx, by),
                             blocked_tiles=blocked_tiles,
-                            want_food=False)
+                            want_food=False,
+                            reserved_cookers=reserved_cookers,
+                            allow_reserved=state.cooker_target)
+                        if cooker:
+                            state.cooker_target = cooker
+                            if reserved_cookers is not None:
+                                reserved_cookers.add(cooker)
                         if cooker and self.move_to(controller, bot_id, cooker[0], cooker[1], blocked_tiles):
                             controller.place(bot_id, cooker[0], cooker[1])
                         return
@@ -1250,7 +1362,8 @@ class BotPlayer:
                             state.task_stage = 12
                         self.process_chop_cook(
                             controller, bot_id, state, holding, reserved_counters, blocked_tiles, held_name,
-                            my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper)
+                            my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper,
+                            reserved_cookers=reserved_cookers)
                         return
                     if self.needs_cooking(held_name):
                         if state.task_stage != 12 or not state.ingredients_needed or state.ingredients_needed[0] != held_name:
@@ -1259,7 +1372,8 @@ class BotPlayer:
                             state.task_stage = 12
                         self.process_cook_only(
                             controller, bot_id, state, holding, reserved_counters, blocked_tiles, held_name,
-                            my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper)
+                            my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper,
+                            reserved_cookers=reserved_cookers)
                         return
                     if self.needs_chopping(held_name):
                         if state.task_stage != 12 or not state.ingredients_needed or state.ingredients_needed[0] != held_name:
@@ -1371,6 +1485,8 @@ class BotPlayer:
             state.work_counter = None
             state.sub_state = 0
             state.current_order = None
+            state.cooker_target = None
+            state.cooker_target = None
 
             # Helper mode for split maps: pick up cookable handoff items if no shop access.
             if not holding and my_dist and not self._can_access_any_shop(my_dist):
@@ -1427,6 +1543,10 @@ class BotPlayer:
                 state.ingredients_needed = [i for i in req if not self.needs_cooking(i)] + \
                     [i for i in req if self.needs_cooking(i)]
                 state.task_stage = 1
+            else:
+                if not holding and self.shop_loc:
+                    self.move_to(
+                        controller, bot_id, self.shop_loc[0], self.shop_loc[1], blocked_tiles)
 
         # State 1: Ensure pan
         elif state.task_stage == 1:
@@ -1469,10 +1589,13 @@ class BotPlayer:
                         anchor = self.cooker_priority[0] if self.cooker_priority else None
                         state.plate_counter = self.get_free_counter(
                             controller,
-                            exclude=reserved_counters,
+                            exclude=exclude_counters,
                             bot_pos=(bx, by),
                             blocked_tiles=blocked_tiles,
-                            anchor_pos=anchor)
+                            anchor_pos=anchor,
+                            zone_anchor=state.zone_anchor,
+                            next_target=self.submit_loc,
+                            bot_dist_map=my_dist)
 
                     if state.plate_counter:
                         if my_dist and not self._has_access(my_dist, state.plate_counter):
@@ -1635,11 +1758,13 @@ class BotPlayer:
             if chop and cook:
                 self.process_chop_cook(
                     controller, bot_id, state, holding, reserved_counters, blocked_tiles, ing,
-                    my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper)
+                    my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper,
+                    reserved_cookers=reserved_cookers)
             elif cook:
                 self.process_cook_only(
                     controller, bot_id, state, holding, reserved_counters, blocked_tiles, ing,
-                    my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper)
+                    my_dist=my_dist, other_dist_maps=other_dist_maps, helper_mode=is_helper,
+                    reserved_cookers=reserved_cookers)
             elif chop:
                 self.process_chop_only(
                     controller, bot_id, state, holding, reserved_counters, blocked_tiles,
@@ -1725,6 +1850,7 @@ class BotPlayer:
                         state.pending_order_id = None
                         state.pending_items = []
                         state.task_stage = 0
+                        state.cooker_target = None
                     else:
                         state.task_stage = 20
                 else:
@@ -1743,6 +1869,7 @@ class BotPlayer:
                     state.plate_counter = None
                     state.work_counter = None
                     state.current_order = None
+                    state.cooker_target = None
             else:
                 state.task_stage = 0
                 state.sub_state = 0
@@ -1750,12 +1877,20 @@ class BotPlayer:
                 state.plate_counter = None
                 state.work_counter = None
                 state.current_order = None
+                state.cooker_target = None
 
-    def run_normal_logic(self, controller, bot_id, state, reserved_counters, claimed_orders, blocked_tiles, order_heuristic):
+    def run_normal_logic(self, controller, bot_id, state, reserved_counters, reserved_cookers, claimed_orders, blocked_tiles, order_heuristic):
         # Snapshot3 normal-map logic (no helper/handoff behaviors).
         info = controller.get_bot_state(bot_id)
         holding = info.get('holding')
         bx, by = info['x'], info['y']
+        my_dist = self.bot_dist_maps.get(bot_id)
+        my_reserved_counters = set()
+        if state.plate_counter:
+            my_reserved_counters.add(state.plate_counter)
+        if state.work_counter:
+            my_reserved_counters.add(state.work_counter)
+        exclude_counters = reserved_counters - my_reserved_counters
 
         sx, sy = self.shop_loc
         ux, uy = self.submit_loc
@@ -1817,6 +1952,10 @@ class BotPlayer:
                 state.ingredients_needed = [i for i in req if not self.needs_cooking(i)] + \
                     [i for i in req if self.needs_cooking(i)]
                 state.task_stage = 1
+            else:
+                if not holding and self.shop_loc:
+                    self.move_to(
+                        controller, bot_id, self.shop_loc[0], self.shop_loc[1], blocked_tiles)
 
         # State 1: Ensure pan
         elif state.task_stage == 1:
@@ -1853,10 +1992,13 @@ class BotPlayer:
                         anchor = self.cooker_priority[0] if self.cooker_priority else None
                         state.plate_counter = self.get_free_counter(
                             controller,
-                            exclude=reserved_counters,
+                            exclude=exclude_counters,
                             bot_pos=(bx, by),
                             blocked_tiles=blocked_tiles,
-                            anchor_pos=anchor)
+                            anchor_pos=anchor,
+                            zone_anchor=state.zone_anchor,
+                            next_target=self.submit_loc,
+                            bot_dist_map=my_dist)
 
                     if state.plate_counter:
                         # Reserve it
@@ -1970,10 +2112,12 @@ class BotPlayer:
 
             if chop and cook:
                 self.process_chop_cook(
-                    controller, bot_id, state, holding, reserved_counters, blocked_tiles, ing)
+                    controller, bot_id, state, holding, reserved_counters, blocked_tiles, ing,
+                    reserved_cookers=reserved_cookers)
             elif cook:
                 self.process_cook_only(
-                    controller, bot_id, state, holding, reserved_counters, blocked_tiles, ing)
+                    controller, bot_id, state, holding, reserved_counters, blocked_tiles, ing,
+                    reserved_cookers=reserved_cookers)
             elif chop:
                 self.process_chop_only(
                     controller, bot_id, state, holding, reserved_counters, blocked_tiles)
@@ -2037,6 +2181,7 @@ class BotPlayer:
                 if controller.can_submit(bot_id, ux, uy):
                     if controller.submit(bot_id, ux, uy):
                         state.task_stage = 0
+                        state.cooker_target = None
                 else:
                     state.task_stage = 20
 
@@ -2052,6 +2197,7 @@ class BotPlayer:
                     state.plate_counter = None
                     state.work_counter = None
                     state.current_order = None
+                    state.cooker_target = None
             else:
                 state.task_stage = 0
                 state.sub_state = 0
@@ -2059,6 +2205,7 @@ class BotPlayer:
                 state.plate_counter = None
                 state.work_counter = None
                 state.current_order = None
+                state.cooker_target = None
 
     def process_chop_only(self, controller, bot_id, state, holding, reserved, blocked, my_dist=None, other_dist_maps=None, helper_mode=False):
         if not state.work_counter:
@@ -2074,7 +2221,10 @@ class BotPlayer:
                 exclude,
                 bot_pos=(bot_state['x'], bot_state['y']),
                 blocked_tiles=blocked,
-                anchor_pos=anchor)
+                anchor_pos=anchor,
+                zone_anchor=state.zone_anchor,
+                next_target=state.plate_counter or self.submit_loc,
+                bot_dist_map=my_dist)
 
         if not state.work_counter:
             state.task_stage = 99
@@ -2125,7 +2275,8 @@ class BotPlayer:
                         state.task_stage = 13
                         state.sub_state = 0
 
-    def process_cook_only(self, controller, bot_id, state, holding, reserved, blocked, ing, my_dist=None, other_dist_maps=None, helper_mode=False):
+    def process_cook_only(self, controller, bot_id, state, holding, reserved, blocked, ing,
+                          my_dist=None, other_dist_maps=None, helper_mode=False, reserved_cookers=None):
         if state.sub_state == 0:  # Place on cooker
             if holding:
                 if holding.get('type') == 'Food':
@@ -2164,8 +2315,14 @@ class BotPlayer:
                             anchor_pos=anchor,
                             bot_pos=(bot_state['x'], bot_state['y']),
                             blocked_tiles=blocked,
-                            want_food=False)
+                            want_food=False,
+                            reserved_cookers=reserved_cookers,
+                            allow_reserved=state.cooker_target)
                         state.cooker_target = cooker
+                        if cooker and reserved_cookers is not None:
+                            reserved_cookers.add(cooker)
+                        if cooker and reserved_cookers is not None:
+                            reserved_cookers.add(cooker)
 
                     if cooker:
                         kx, ky = cooker
@@ -2215,9 +2372,13 @@ class BotPlayer:
                     anchor_pos=anchor,
                     bot_pos=(bot_state['x'], bot_state['y']),
                     blocked_tiles=blocked,
-                    want_food=True)
+                    want_food=True,
+                    reserved_cookers=reserved_cookers,
+                    allow_reserved=state.cooker_target)
                 if picked:
                     state.cooker_target = picked
+                    if reserved_cookers is not None:
+                        reserved_cookers.add(picked)
                     candidates.append(picked)
 
             for kx, ky in candidates:
@@ -2252,7 +2413,8 @@ class BotPlayer:
             state.task_stage = 11
             state.sub_state = 0
 
-    def process_chop_cook(self, controller, bot_id, state, holding, reserved, blocked, ing, my_dist=None, other_dist_maps=None, helper_mode=False):
+    def process_chop_cook(self, controller, bot_id, state, holding, reserved, blocked, ing,
+                          my_dist=None, other_dist_maps=None, helper_mode=False, reserved_cookers=None):
         if not state.work_counter:
             exclude = set(reserved)
             if state.plate_counter:
@@ -2264,7 +2426,10 @@ class BotPlayer:
                 exclude,
                 bot_pos=(bot_state['x'], bot_state['y']),
                 blocked_tiles=blocked,
-                anchor_pos=anchor)
+                anchor_pos=anchor,
+                zone_anchor=state.zone_anchor,
+                next_target=self.cooker_priority[0] if self.cooker_priority else None,
+                bot_dist_map=my_dist)
 
         if not state.work_counter:
             state.task_stage = 99
@@ -2361,7 +2526,9 @@ class BotPlayer:
                             anchor_pos=anchor,
                             bot_pos=(bot_state['x'], bot_state['y']),
                             blocked_tiles=blocked,
-                            want_food=False)
+                            want_food=False,
+                            reserved_cookers=reserved_cookers,
+                            allow_reserved=state.cooker_target)
                         state.cooker_target = cooker
 
                     if cooker:
@@ -2402,9 +2569,13 @@ class BotPlayer:
                     anchor_pos=anchor,
                     bot_pos=(bot_state['x'], bot_state['y']),
                     blocked_tiles=blocked,
-                    want_food=True)
+                    want_food=True,
+                    reserved_cookers=reserved_cookers,
+                    allow_reserved=state.cooker_target)
                 if picked:
                     state.cooker_target = picked
+                    if reserved_cookers is not None:
+                        reserved_cookers.add(picked)
                     candidates.append(picked)
 
             for kx, ky in candidates:
