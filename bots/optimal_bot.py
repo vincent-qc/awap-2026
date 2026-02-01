@@ -422,7 +422,9 @@ class BotPlayer:
         turn = controller.get_turn()
         
         # Optional: Strategic map switching
-        if controller.can_switch_maps() and turn >= 320 and self.orders_completed >= 2:
+        switch_info = controller.get_switch_info()
+        switch_threshold = switch_info["switch_turn"] + int(switch_info["switch_duration"] * 0.7)
+        if controller.can_switch_maps() and turn >= switch_threshold and self.orders_completed >= 2:
             controller.switch_maps()
         
         for i, bot_id in enumerate(my_bots):

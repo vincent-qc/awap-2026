@@ -34,7 +34,7 @@ class BotPlayer:
     HEURISTIC_EXPIRY = "expiry"
     HEURISTIC_INGREDIENTS = "ingredients"
     HEURISTIC_PROFIT = "profit"
-    ENDGAME_ASSIST_TURNS = 50
+    ENDGAME_ASSIST_TURNS = max(50, GameConstants.TOTAL_TURNS // 5)
 
     def __init__(self, map_copy):
         self.map = map_copy
@@ -314,6 +314,33 @@ class BotPlayer:
             return None
         return best
 
+    def _pick_proactive_idle_target(self, controller, bot_id, state, dist_map):
+        # Proactively drift toward the next likely work area when idle.
+        orders = controller.get_orders(controller.get_team())
+        turn = controller.get_turn()
+        team_money = controller.get_team_money(controller.get_team())
+        best = None
+        best_score = -float('inf')
+        for o in orders:
+            if not o['is_active'] or o['expires_turn'] <= turn:
+                continue
+            score = self.calculate_order_heuristic(
+                controller, bot_id, state, o, turn, team_money, self.HEURISTIC_INGREDIENTS)
+            if score > best_score:
+                best_score = score
+                best = o
+        if not best:
+            return None
+        needs_cook = any(self.needs_cooking(i)
+                         for i in best.get('required', []))
+        if needs_cook and self.cookers:
+            target = self.cooker_priority[0] if self.cooker_priority else self.cookers[0]
+        else:
+            target = self.shop_loc
+        if target and dist_map and not self._has_access(dist_map, target):
+            return None
+        return target
+
     def _relocate_if_idle(self, controller, bot_id, state, bot_pos, dist_map, blocked_tiles):
         if state.current_order or state.pending_order_ids:
             return False
@@ -323,6 +350,14 @@ class BotPlayer:
             return False
         if state.task_stage != 0:
             return False
+        proactive = self._pick_proactive_idle_target(
+            controller, bot_id, state, dist_map)
+        if proactive and proactive != bot_pos:
+            step = self.get_next_step_astar(
+                controller, bot_pos, proactive[0], proactive[1], blocked=blocked_tiles)
+            if step and step != (0, 0):
+                controller.move(bot_id, step[0], step[1])
+                return True
         if bot_pos not in self.critical_tiles:
             return False
         target = self._nearest_idle_safe_tile(bot_pos, dist_map, blocked_tiles)
@@ -1021,7 +1056,7 @@ class BotPlayer:
                     plated.append(item['food_name'])
         return plated
 
-    def recompute_remaining_for_order(self, controller, state, order):
+    def _build_ingredients_needed(self, controller, state, order, priority_item=None):
         required = list(order['required'])
         plated = self.get_plated_inventory(controller)
         for item in plated:
@@ -1035,8 +1070,51 @@ class BotPlayer:
                     required.remove(item)
         ordered = pending_first + [i for i in required if not self.needs_cooking(i)] + \
             [i for i in required if self.needs_cooking(i)]
+        if priority_item and priority_item in ordered:
+            ordered.remove(priority_item)
+            ordered = [priority_item] + ordered
+        return ordered
+
+    def recompute_remaining_for_order(self, controller, state, order, priority_item=None):
+        ordered = self._build_ingredients_needed(
+            controller, state, order, priority_item=priority_item)
         state.current_order = order
         state.ingredients_needed = ordered
+        state.task_stage = 20 if not state.ingredients_needed else 10
+
+    def _find_best_reuse_order(self, controller, state, claimed_orders, inventory, turn, require_item=None):
+        orders = controller.get_orders(controller.get_team())
+        best_match = None
+        best_match_score = -1
+        for o in orders:
+            if not o['is_active'] or o['expires_turn'] <= turn:
+                continue
+            if o['order_id'] in claimed_orders:
+                if not state.current_order or o['order_id'] != state.current_order['order_id']:
+                    continue
+            if require_item and require_item not in o['required']:
+                continue
+            needed = list(o['required'])[:]
+            score = 0
+            for inv_item in inventory:
+                if inv_item in needed:
+                    score += 5
+                    needed.remove(inv_item)
+            score += len(o['required'])
+            if score > best_match_score:
+                best_match_score = score
+                best_match = o
+        if best_match and best_match_score > 0:
+            return best_match
+        return None
+
+    def _switch_to_rescue_order(self, controller, state, claimed_orders, order, priority_item=None):
+        if state.current_order and state.current_order['order_id'] in claimed_orders:
+            claimed_orders.remove(state.current_order['order_id'])
+        state.current_order = order
+        claimed_orders.add(order['order_id'])
+        state.ingredients_needed = self._build_ingredients_needed(
+            controller, state, order, priority_item=priority_item)
         state.task_stage = 20 if not state.ingredients_needed else 10
 
     def add_pending_order(self, state, order_id, item_name=None):
@@ -1161,84 +1239,46 @@ class BotPlayer:
             print(
                 f"[Bot {bot_id}] Has inventory {inventory}, trying to reuse...")
 
-            # Score active orders based on inventory match
-            best_match = None
-            best_match_score = -1
-
-            for o in orders:
-                if not o['is_active'] or o['expires_turn'] <= turn:
-                    continue
-                if o['order_id'] in claimed_orders:
-                    continue
-
-                # Count how many inventory items are useful for this order
-                needed = list(o['required'])[:]
-                score = 0
-                for inv_item in inventory:
-                    if inv_item in needed:
-                        score += 5  # high value for reuse
-                        needed.remove(inv_item)
-
-                # Tie-breaker: prioritization logic (time, value) from normal selection
-                # Prefer more complex recipes if equal reuse
-                score += len(o['required'])
-
-                if score > best_match_score:
-                    best_match_score = score
-                    best_match = o
-
-            if best_match and best_match_score > 0:
+            best_match = self._find_best_reuse_order(
+                controller, state, claimed_orders, inventory, turn)
+            if best_match:
                 print(
                     f"[Bot {bot_id}] Switched to Order {best_match['order_id']} to reuse ingredients")
-
-                # Unclaim old order just in case (though it's expired)
-                if current['order_id'] in claimed_orders:
-                    claimed_orders.remove(current['order_id'])
-
-                state.current_order = best_match
-                claimed_orders.add(best_match['order_id'])
-
-                # Re-calculate ingredients needed
-                req = list(best_match['required'])
-                remaining_needed = list(req)
-
-                # Identify items that are ALREADY PLATED (safely done)
-                plated_items = []
-
-                # Check plate on counter
-                if state.plate_counter:
-                    tile = controller.get_tile(
-                        controller.get_team(), *state.plate_counter)
-                    if tile and tile.item and isinstance(tile.item, Plate):
-                        for item in tile.item.food:
-                            plated_items.append(item.food_name)
-
-                # Check plate in hand
                 info = controller.get_bot_state(bot_id)
                 holding = info.get('holding')
-                if holding and holding.get('type') == 'Plate':
-                    for item in holding.get('food', []):
-                        plated_items.append(item['food_name'])
-
-                # Remove plated items from requirements
-                for done_item in plated_items:
-                    if done_item in remaining_needed:
-                        remaining_needed.remove(done_item)
-
-                # Reset needs
-                state.ingredients_needed = [i for i in remaining_needed if not self.needs_cooking(i)] + \
-                    [i for i in remaining_needed if self.needs_cooking(i)]
-
-                # Safe bet: State 10 will check needs and proceed.
-                state.task_stage = 10
+                priority_item = None
+                if holding and holding.get('type') == 'Food':
+                    if holding.get('food_name') in best_match.get('required', []):
+                        priority_item = holding.get('food_name')
+                self._switch_to_rescue_order(
+                    controller, state, claimed_orders, best_match, priority_item=priority_item)
                 return True
-            else:
-                print(
-                    f"[Bot {bot_id}] No matching order for reuse. Resetting.")
-                state.task_stage = 99
-                return True
+            print(
+                f"[Bot {bot_id}] No matching order for reuse. Resetting.")
+            state.task_stage = 99
+            return True
 
         return False
+
+    def _try_rescue_before_trash(self, controller, bot_id, state, claimed_orders):
+        info = controller.get_bot_state(bot_id)
+        holding = info.get('holding')
+        if not holding or holding.get('type') != 'Food':
+            return False
+        if holding.get('cooked_stage', 0) == 2:
+            return False
+        held_name = holding.get('food_name')
+        inventory = self.get_bot_inventory(controller, bot_id, state)
+        turn = controller.get_turn()
+        best_match = self._find_best_reuse_order(
+            controller, state, claimed_orders, inventory, turn, require_item=held_name)
+        if not best_match:
+            return False
+        self._switch_to_rescue_order(
+            controller, state, claimed_orders, best_match, priority_item=held_name)
+        state.sub_state = 0
+        state.task_stage = 12
+        return True
 
     def _dist_from_grid(self, dist_map, pos):
         if not dist_map or not pos or not self.cached_map:
@@ -1531,6 +1571,10 @@ class BotPlayer:
         info = controller.get_bot_state(bot_id)
         holding = info.get('holding')
         bx, by = info['x'], info['y']
+
+        if state.current_order:
+            if self.handle_expired_order(controller, bot_id, state, claimed_orders):
+                pass
 
         my_dist = self.bot_dist_maps.get(bot_id)
         other_dist_maps = [
@@ -2147,6 +2191,8 @@ class BotPlayer:
 
         # State 99: Trash
         elif state.task_stage == 99:
+            if self._try_rescue_before_trash(controller, bot_id, state, claimed_orders):
+                return
             if holding and self.trash_loc:
                 tx, ty = self.trash_loc
                 if self.move_to(controller, bot_id, tx, ty, blocked_tiles):
@@ -2494,6 +2540,8 @@ class BotPlayer:
 
         # State 99: Trash
         elif state.task_stage == 99:
+            if self._try_rescue_before_trash(controller, bot_id, state, claimed_orders):
+                return
             if holding and self.trash_loc:
                 tx, ty = self.trash_loc
                 if self.move_to(controller, bot_id, tx, ty, blocked_tiles):
